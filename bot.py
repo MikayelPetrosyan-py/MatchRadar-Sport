@@ -1,20 +1,17 @@
 """
 bot.py
 
-Football Telegram Bot
+Multi-Sport Telegram Bot
 
 Features:
-- Today's matches
-- Tomorrow's matches
-- This week's matches
-- This month's matches
-- League selection
-- All Top Leagues
-- 🔥 Top Matches
-- Small team logos inside one compact scoreboard
+- Sport selection on /start
+- ⚽ Football: existing league / period flow
+- 🏀 Basketball: NBA daily scoreboard
+- 🏒 Hockey: NHL daily scoreboard
+- 🎾 Tennis: ATP/WTA top tournaments
+- 🏎️ Formula 1: current-season race schedule
 - Back navigation
 - Refresh
-- football-data.org API
 
 Status handling: this file never re-derives its own status alias sets. All
 match statuses are one of api.py's canonical codes (NS, HT, LIVE, FT, PST,
@@ -28,11 +25,86 @@ with what the live-refresh code actually decided.
 import asyncio
 import io
 import logging
+import os
+import sys
+import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
+
+# ============================================================
+# TERMINAL ERROR / DEBUG LOG
+# ============================================================
+# Everything printed to the terminal is also saved to
+# matchradar_terminal.log next to bot.py.
+# This includes API prints, logging output, tracebacks and errors.
+# The file is reset on every bot start, so it always contains the latest run.
+_TERMINAL_LOG_PATH = Path(__file__).with_name("matchradar_terminal.log")
+
+
+class _TeeStream:
+    def __init__(self, original, log_file):
+        self.original = original
+        self.log_file = log_file
+
+    def write(self, data):
+        try:
+            self.original.write(data)
+            self.original.flush()
+        except Exception:
+            pass
+        try:
+            self.log_file.write(data)
+            self.log_file.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self.original.flush()
+        except Exception:
+            pass
+        try:
+            self.log_file.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self.original.isatty()
+        except Exception:
+            return False
+
+
+_terminal_log_file = open(
+    _TERMINAL_LOG_PATH,
+    "w",
+    encoding="utf-8",
+    buffering=1,
+)
+_terminal_log_file.write("=" * 80 + "\n")
+_terminal_log_file.write("MATCHRADAR TERMINAL LOG\n")
+_terminal_log_file.write("If something breaks, send this file to ChatGPT.\n")
+_terminal_log_file.write("=" * 80 + "\n")
+_terminal_log_file.flush()
+
+sys.stdout = _TeeStream(sys.stdout, _terminal_log_file)
+sys.stderr = _TeeStream(sys.stderr, _terminal_log_file)
+
+
+def _log_uncaught_exception(exc_type, exc_value, exc_traceback):
+    # Keep the normal traceback in the terminal AND in the log file.
+    if exc_type is KeyboardInterrupt:
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
+sys.excepthook = _log_uncaught_exception
+
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from telegram import (
     InlineKeyboardButton,
@@ -49,9 +121,9 @@ from telegram.ext import (
     ContextTypes,
 )
 
+
 import api
 from config import BOT_TOKEN
-
 
 # ============================================================
 # Logging
@@ -61,6 +133,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+# httpx logs full Telegram Bot API URLs, which contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 logger.info("Bookmaker odds: %s (API key loaded: %s)", api.ODDS_BOOKMAKER, bool(api.ODDS_API_KEY))
@@ -191,15 +267,37 @@ def _get_font(size: int, bold: bool = False):
 # /start
 # ============================================================
 
+SPORT_LABELS = {
+    "tennis": "🎾 Tennis",
+    "basketball": "🏀 Basketball",
+    "hockey": "🏒 Hockey",
+    "f1": "🏎️ Formula 1",
+    "football": "⚽ Football",
+}
+
+
+def _sport_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(SPORT_LABELS["tennis"], callback_data="sport:tennis"),
+            InlineKeyboardButton(SPORT_LABELS["basketball"], callback_data="sport:basketball"),
+        ],
+        [
+            InlineKeyboardButton(SPORT_LABELS["hockey"], callback_data="sport:hockey"),
+            InlineKeyboardButton(SPORT_LABELS["f1"], callback_data="sport:f1"),
+        ],
+        [InlineKeyboardButton(SPORT_LABELS["football"], callback_data="sport:football")],
+    ])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     context.user_data.clear()
 
     await update.message.reply_text(
-        "⚽ MATCHRADAR\n\n"
-        "🏆 Choose a league\n\n"
-        "Football data by 5DollarFootballAPI",
-        reply_markup=_league_keyboard(),
+        "🏆 MySportInfo Bot\n\n"
+        "⚽ What sport would you like to follow?",
+        reply_markup=_sport_keyboard(),
     )
 
 
@@ -236,17 +334,278 @@ async def handle_period_selection(update: Update, context: ContextTypes.DEFAULT_
 # League keyboard
 # ============================================================
 
+# UEFA competitions use the EU flag instead of custom Telegram icons.
+COMPETITION_BUTTON_FLAGS = {
+    "CL": "🇪🇺",
+    "EL": "🇪🇺",
+    "ECL": "🇪🇺",
+}
+
+
 def _league_keyboard() -> InlineKeyboardMarkup:
 
     keyboard = []
     for key, league in api.LEAGUES.items():
-        keyboard.append(
-            [InlineKeyboardButton(f"{league['flag']} {league['name']}", callback_data=f"league:{key}")]
+        league_id = str(league.get("id", "")).upper()
+        flag = COMPETITION_BUTTON_FLAGS.get(league_id, league.get("flag", "⚽"))
+        button = InlineKeyboardButton(
+            f"{flag} {league['name']}",
+            callback_data=f"league:{key}",
         )
+        keyboard.append([button])
 
     keyboard.append([InlineKeyboardButton("🌍 All Top Leagues", callback_data="league:all")])
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")])
     return InlineKeyboardMarkup(keyboard)
+
+
+# ============================================================
+# Multi-sport selection + API flow
+# ============================================================
+
+SPORT_PERIOD_LABELS = {
+    "today": "📅 Today",
+    "tomorrow": "📅 Tomorrow",
+    "week": "🗓 This Week",
+    "month": "📆 This Month",
+}
+
+
+def _tennis_tour_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎾 ATP", callback_data="tennis_tour:atp"),
+            InlineKeyboardButton("🎾 WTA", callback_data="tennis_tour:wta"),
+        ],
+        [InlineKeyboardButton("⬅️ Sports", callback_data="back_to_start")],
+    ])
+
+
+def _sport_period_keyboard(sport: str) -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton(label, callback_data=f"sport_period:{sport}:{period}")]
+        for period, label in SPORT_PERIOD_LABELS.items()
+    ]
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_previous")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _sport_nav_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Back", callback_data="back_to_previous"),
+        InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
+    ]])
+
+
+def _sport_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Back", callback_data="back_to_previous"),
+        InlineKeyboardButton("🏠 Sports", callback_data="back_to_start"),
+    ]])
+
+
+def _sport_period_title(sport: str, period: str) -> str:
+    names = {
+        "basketball": "🏀 NBA",
+        "hockey": "🏒 NHL",
+        "tennis": "🎾 Tennis",
+    }
+    return f"{names.get(sport, SPORT_LABELS.get(sport, sport))}\n\n📅 Choose a period"
+
+
+async def _sport_messages(
+    sport: str,
+    period: str | None = None,
+    tennis_tour: str | None = None,
+):
+    """Fetch normalized non-football event objects from api.py."""
+    if sport == "f1":
+        return await asyncio.to_thread(api.get_sport_messages, sport)
+
+    period = period or "today"
+    date_from, date_to = api.get_date_range(period)
+    if sport == "tennis":
+        return await asyncio.to_thread(
+            api.get_tennis_messages, date_from, date_to, tennis_tour
+        )
+    return await asyncio.to_thread(api.get_sport_messages, sport, date_from, date_to)
+
+
+async def handle_sport_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    sport = query.data.split(":", 1)[1]
+    context.user_data.clear()
+    context.user_data["sport"] = sport
+    context.user_data["mode"] = f"sport_{sport}"
+
+    if sport == "football":
+        context.user_data["mode"] = "league"
+        context.user_data["screen"] = "league_selection"
+        await query.edit_message_text(
+            "⚽ Football\n\n🏆 Choose a league",
+            reply_markup=_league_keyboard(),
+        )
+        return
+
+    if sport == "f1":
+        await _show_sport_matches(query, context, sport, context.user_data.get("period"))
+        return
+
+    if sport == "tennis":
+        context.user_data["screen"] = "tennis_tour_selection"
+        await query.edit_message_text(
+            "🎾 Tennis\n\n🏆 Choose tour",
+            reply_markup=_tennis_tour_keyboard(),
+        )
+        return
+
+    context.user_data["screen"] = "sport_period_selection"
+    await query.edit_message_text(
+        _sport_period_title(sport, "today"),
+        reply_markup=_sport_period_keyboard(sport),
+    )
+
+
+async def handle_tennis_tour_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    tour = query.data.split(":", 1)[1].lower()
+    if tour not in {"atp", "wta"}:
+        await query.answer("Unknown tennis tour.", show_alert=True)
+        return
+
+    context.user_data["sport"] = "tennis"
+    context.user_data["tennis_tour"] = tour
+    context.user_data["mode"] = "sport_tennis"
+    context.user_data["screen"] = "sport_period_selection"
+
+    tour_label = tour.upper()
+    await query.edit_message_text(
+        f"🎾 Tennis — {tour_label}\n\n📅 Choose a period",
+        reply_markup=_sport_period_keyboard("tennis"),
+    )
+
+
+async def handle_sport_period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, sport, period = query.data.split(":", 2)
+    context.user_data["sport"] = sport
+    context.user_data["mode"] = f"sport_{sport}"
+    context.user_data["period"] = period
+    context.user_data["screen"] = "sport_matches"
+
+    await _show_sport_matches(
+        query, context, sport, period, context.user_data.get("tennis_tour")
+    )
+
+
+async def _show_sport_matches(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    sport: str,
+    period: str | None = None,
+    tennis_tour: str | None = None,
+) -> None:
+    await _clear_previous_match_messages(query, context)
+
+    context.user_data["sport"] = sport
+    context.user_data["mode"] = f"sport_{sport}"
+    context.user_data["screen"] = "sport_matches"
+    if period and sport != "f1":
+        context.user_data["period"] = period
+    if sport == "tennis" and tennis_tour:
+        context.user_data["tennis_tour"] = tennis_tour.lower()
+
+    if sport == "f1":
+        loading_text = "🏎️ Formula 1\n\n⏳ Loading current Grand Prix..."
+    else:
+        period = period or context.user_data.get("period", "today")
+        period_name = SPORT_PERIOD_LABELS.get(period, "📅 Today")
+        loading_text = f"{SPORT_LABELS.get(sport, sport)}\n\n{period_name}\n\n⏳ Fetching games..."
+
+    await _edit_navigation_message(
+        query,
+        context,
+        loading_text,
+        reply_markup=_sport_nav_keyboard(),
+    )
+
+    try:
+        items = await _sport_messages(
+            sport, period, context.user_data.get("tennis_tour")
+        )
+    except Exception as exc:
+        logger.exception("Could not fetch %s data", sport)
+        await _edit_navigation_message(
+            query,
+            context,
+            f"{SPORT_LABELS.get(sport, sport)}\n\n⚠️ Could not fetch data.\n\n{exc}",
+            reply_markup=_sport_nav_keyboard(),
+        )
+        return
+
+    if not items:
+        if sport == "f1":
+            empty_title = "🏎️ Formula 1"
+        else:
+            empty_title = f"{SPORT_LABELS.get(sport, sport)}\n\n{SPORT_PERIOD_LABELS.get(period or 'today', '📅 Today')}"
+        await _edit_navigation_message(
+            query,
+            context,
+            f"{empty_title}\n\n😔 No events found.",
+            reply_markup=_sport_nav_keyboard(),
+        )
+        context.user_data["match_message_ids"] = []
+        return
+
+    if sport == "f1":
+        item_label = "🏎️ Current Grand Prix"
+    elif sport == "tennis":
+        tour_label = str(context.user_data.get("tennis_tour") or "ATP").upper()
+        item_label = f"🎾 Tennis — {tour_label} • {SPORT_PERIOD_LABELS.get(period or 'today', '📅 Today')}"
+    else:
+        item_label = f"{SPORT_LABELS.get(sport, sport)} • {SPORT_PERIOD_LABELS.get(period or 'today', '📅 Today')}"
+
+    await _edit_navigation_message(
+        query,
+        context,
+        f"{item_label}\n\n📊 {len(items)} event(s)",
+        reply_markup=_sport_nav_keyboard(),
+    )
+
+    sent_ids = []
+    chat_id = query.message.chat_id
+
+    for index, (fallback_text, item) in enumerate(items):
+        keyboard = _sport_back_keyboard() if index == len(items) - 1 else None
+        try:
+            card = await asyncio.to_thread(_create_sport_card, item)
+            message = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=InputFile(card, filename="sport_card.png"),
+                reply_markup=keyboard,
+            )
+            sent_ids.append(message.message_id)
+        except Exception:
+            logger.exception("Could not create/send %s visual card", sport)
+            try:
+                message = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=str(fallback_text or _sport_fallback_text(item)),
+                    reply_markup=keyboard,
+                )
+                sent_ids.append(message.message_id)
+            except Exception:
+                logger.exception("Could not send %s fallback", sport)
+        await asyncio.sleep(SEND_DELAY_SECONDS)
+
+    context.user_data["match_message_ids"] = sent_ids
+    context.user_data["chat_id"] = chat_id
 
 
 # ============================================================
@@ -273,7 +632,7 @@ async def handle_back_to_leagues(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
 
     context.user_data["screen"] = "league_selection"
-    await query.edit_message_text("🏆 Choose a league", reply_markup=_league_keyboard())
+    await query.edit_message_text("⚽ Football\n\n🏆 Choose a league", reply_markup=_league_keyboard())
 
 
 # ============================================================
@@ -434,7 +793,7 @@ def _create_match_card(match: dict) -> io.BytesIO:
     """Create a larger, phone-readable premium football scoreboard card."""
 
     width = 900
-    height = 430
+    height = 500
 
     image = Image.new("RGB", (width, height))
     pixels = image.load()
@@ -583,34 +942,115 @@ def _create_match_card(match: dict) -> io.BytesIO:
         footer = f"Kick-off  •  {time_text}" if time_text else "Kick-off"
         centered_text(footer, 450, 265, status_font, (105, 137, 134))
 
+    # ========================================================
+    # ODDS
+    # ========================================================
+
     odds_data = match.get("odds_1x2") or {}
+
     odds_home = odds_data.get("home")
     odds_draw = odds_data.get("draw")
     odds_away = odds_data.get("away")
 
-    if any(value is not None for value in (odds_home, odds_draw, odds_away)):
+    first_half = match.get("odds_1h_1x2") or {}
+
+    fh_home = first_half.get("home")
+    fh_draw = first_half.get("draw")
+    fh_away = first_half.get("away")
+
+    has_full_match = any(
+        value is not None
+        for value in (
+            odds_home,
+            odds_draw,
+            odds_away,
+        )
+    )
+
+    has_first_half = any(
+        value is not None
+        for value in (
+            fh_home,
+            fh_draw,
+            fh_away,
+        )
+    )
+
+    if has_full_match or has_first_half:
         odds_label_font = _get_font(14, bold=True)
         odds_value_font = _get_font(20, bold=True)
 
-        draw.line((120, 305, 780, 305), fill=(37, 61, 63), width=1)
+        draw.line(
+            (120, 305, 780, 305),
+            fill=(37, 61, 63),
+            width=1,
+        )
 
-        source = str(odds_data.get("bookmaker", "")).strip()
-        label = "MATCH RESULT"
-        if source and source != "consensus":
+        source = str(
+            odds_data.get("bookmaker", "")
+        ).strip()
+
+        if source and source.lower() != "consensus":
             label = f"MATCH RESULT • {source.upper()}"
+        else:
+            label = "MATCH RESULT"
 
-        centered_text(label, 450, 316, odds_label_font, (139, 166, 163))
+        centered_text(
+            label,
+            450,
+            316,
+            odds_label_font,
+            (139, 166, 163),
+        )
 
-        def odds_text(label: str, value):
-            return f"{label}  {value:.2f}" if value is not None else f"{label}  —"
+        def odds_text(label_text: str, value):
+            if value is None:
+                return f"{label_text}  —"
 
-        odds_parts = [
+            try:
+                return f"{label_text}  {float(value):.2f}"
+            except (TypeError, ValueError):
+                return f"{label_text}  —"
+
+        full_match_parts = [
             (odds_text("1", odds_home), 260),
             (odds_text("X", odds_draw), 450),
             (odds_text("2", odds_away), 640),
         ]
-        for text, center_x in odds_parts:
-            centered_text(text, center_x, 340, odds_value_font, (241, 247, 245))
+
+        for text_value, center_x in full_match_parts:
+            centered_text(
+                text_value,
+                center_x,
+                340,
+                odds_value_font,
+                (241, 247, 245),
+            )
+
+        if has_first_half:
+            centered_text(
+                "1ST HALF",
+                450,
+                380,
+                odds_label_font,
+                (139, 166, 163),
+            )
+
+            first_half_parts = [
+                (odds_text("1", fh_home), 260),
+                (odds_text("X", fh_draw), 450),
+                (odds_text("2", fh_away), 640),
+            ]
+
+            for text_value, center_x in first_half_parts:
+                centered_text(
+                    text_value,
+                    center_x,
+                    404,
+                    odds_value_font,
+                    (241, 247, 245),
+                )
+
 
     output = io.BytesIO()
     output.name = "match_card.png"
@@ -624,15 +1064,7 @@ def _create_match_card(match: dict) -> io.BytesIO:
 # ============================================================
 
 def _download_logo(url: str | None):
-    if not url:
-        return None
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        return Image.open(io.BytesIO(response.content)).convert("RGBA")
-    except Exception as exc:
-        logger.warning("Could not download logo: %s", exc)
-        return None
+    return _download_asset(url)
 
 
 def _prepare_logo(logo: Image.Image, size: int) -> Image.Image:
@@ -644,6 +1076,536 @@ def _prepare_logo(logo: Image.Image, size: int) -> Image.Image:
     y = (size - logo.height) // 2
     canvas.paste(logo, (x, y), logo)
     return canvas
+
+
+# ============================================================
+# Visual cards for non-football sports
+# ============================================================
+
+
+def _download_asset(url: str | None):
+    if not url:
+        return None
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        # Tennis API player photos are served from the RapidAPI host and
+        # require the same RapidAPI authorization as the JSON endpoints.
+        if "tennis-api-atp-wta-itf.p.rapidapi.com" in url:
+            rapid_key = os.getenv("TENNIS_RAPIDAPI_KEY") or os.getenv("RAPIDAPI_KEY")
+            if rapid_key:
+                headers.update({
+                    "X-RapidAPI-Key": rapid_key,
+                    "X-RapidAPI-Host": "tennis-api-atp-wta-itf.p.rapidapi.com",
+                })
+        response = requests.get(url, timeout=10, headers=headers)
+        response.raise_for_status()
+        content_type = str(response.headers.get("Content-Type", "")).lower()
+        data = response.content
+
+        if url.lower().endswith(".svg") or "image/svg" in content_type:
+            try:
+                import cairosvg
+                data = cairosvg.svg2png(bytestring=data, output_width=500, output_height=500)
+            except Exception:
+                return None
+
+        return Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception as exc:
+        logger.warning("Could not download sport asset: %s", exc)
+        return None
+
+
+def _paste_round_asset(image: Image.Image, asset, center_x: int, center_y: int, size: int):
+    frame = draw = ImageDraw.Draw(image)
+    draw.ellipse(
+        (center_x - size // 2 - 5, center_y - size // 2 - 5,
+         center_x + size // 2 + 5, center_y + size // 2 + 5),
+        fill=(10, 30, 35),
+        outline=(48, 74, 76),
+        width=2,
+    )
+    if asset is None:
+        return
+
+    try:
+        prepared = ImageOps.fit(asset, (size, size), method=Image.Resampling.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+        image.paste(prepared, (center_x - size // 2, center_y - size // 2), mask)
+    except Exception:
+        pass
+
+
+def _sport_status_label(item: dict) -> str:
+    status = str(item.get("status") or "NS").upper()
+    if status == "LIVE":
+        extra = []
+        if item.get("period"):
+            extra.append(f"P{item['period']}")
+        if item.get("clock"):
+            extra.append(str(item["clock"]))
+        if item.get("live_text"):
+            extra.append(str(item["live_text"]))
+        return "LIVE" + (" • " + " • ".join(extra) if extra else "")
+    if status == "FT":
+        return "FINISHED"
+    return "NOT STARTED"
+
+
+def _sport_score(item: dict) -> str:
+    if str(item.get("status") or "NS").upper() == "NS":
+        return "VS"
+    if item.get("type") == "player_match":
+        return str(item.get("score_text") or "LIVE")
+    home = item.get("home_score")
+    away = item.get("away_score")
+    if home is None and away is None:
+        return "VS"
+    return f"{home if home is not None else 0}  -  {away if away is not None else 0}"
+
+
+def _draw_sport_odds(draw, centered_text, item: dict, center_y: int = 360):
+    odds = item.get("odds") or {}
+    left = odds.get("left")
+    right = odds.get("right")
+    middle = odds.get("draw")
+    if left is None and right is None and middle is None:
+        if str(item.get("sport") or "").lower() == "hockey":
+            draw.line((120, center_y - 18, 780, center_y - 18), fill=(37, 61, 63), width=1)
+            centered_text("ODDS", 450, center_y, _get_font(14, bold=True), (139, 166, 163))
+            centered_text(
+                "No bookmaker prices available",
+                450,
+                center_y + 26,
+                _get_font(16),
+                (169, 194, 189),
+            )
+            return center_y + 66
+        return
+
+    draw.line((120, center_y - 18, 780, center_y - 18), fill=(37, 61, 63), width=1)
+    bookmaker = str(odds.get("bookmaker") or "").strip()
+    source = bookmaker.upper()
+    label = "WINNER COEFFICIENT" + (f" • {source.upper()}" if source else "")
+    label_font = _get_font(14, bold=True)
+    value_font = _get_font(20, bold=True)
+    centered_text(label, 450, center_y, label_font, (139, 166, 163))
+
+    def val(x):
+        if x is None:
+            return "—"
+        try:
+            return f"{float(x):.2f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    if middle is not None:
+        parts = [
+            (f"1  {val(left)}", 230),
+            (f"X  {val(middle)}", 450),
+            (f"2  {val(right)}", 670),
+        ]
+    else:
+        parts = [
+            (f"{str(item.get('home_name') or '1')[:18]}  {val(left)}", 250),
+            (f"{str(item.get('away_name') or '2')[:18]}  {val(right)}", 650),
+        ]
+    for txt, x in parts:
+        centered_text(txt, x, center_y + 28, value_font, (241, 247, 245))
+    return center_y + 70
+
+
+def _create_sport_team_card(item: dict) -> io.BytesIO:
+    width, height = 900, 535
+    image = Image.new("RGB", (width, height))
+    pixels = image.load()
+    top = (6, 17, 23)
+    bottom = (5, 34, 29)
+    for y in range(height):
+        t = y / max(height - 1, 1)
+        r = int(top[0] * (1 - t) + bottom[0] * t)
+        g = int(top[1] * (1 - t) + bottom[1] * t)
+        b = int(top[2] * (1 - t) + bottom[2] * t)
+        for x in range(width):
+            edge = abs(x - width / 2) / (width / 2)
+            glow = int(4 * (1 - edge))
+            pixels[x, y] = (r + glow, g + glow, b + glow)
+
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((4, 4, width - 5, height - 5), radius=24, fill=(7, 24, 28), outline=(42, 67, 70), width=2)
+    draw.rounded_rectangle((26, 15, width - 26, 18), radius=2, fill=(24, 174, 105))
+
+    icon = str(item.get("sport_icon") or "🏆")
+    competition = str(item.get("competition") or "")
+    title = f"{icon} {competition.upper()}"
+    date_text = str(item.get("date") or "")
+    time_text = str(item.get("time") or "")
+    title_font = _get_font(24, bold=True)
+    meta_font = _get_font(19)
+    score_font = _get_font(48, bold=True)
+    status_font = _get_font(16, bold=True)
+
+    draw.text((30, 35), title, fill=(245, 249, 248), font=title_font)
+    header_right = "  •  ".join(x for x in (date_text, time_text) if x)
+    if header_right:
+        bbox = draw.textbbox((0, 0), header_right, font=meta_font)
+        draw.text((870 - (bbox[2] - bbox[0]), 38), header_right, fill=(190, 208, 207), font=meta_font)
+    draw.line((30, 78, 870, 78), fill=(37, 61, 63), width=1)
+
+    def fit_text(text: str, max_width: int):
+        for size in range(30, 16, -1):
+            font = _get_font(size, bold=True)
+            if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+                return font
+        return _get_font(17, bold=True)
+
+    def center(text, x, y, font, fill=(244, 248, 247)):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        draw.text((x - (bbox[2] - bbox[0]) / 2, y), text, font=font, fill=fill)
+
+    home_name = str(item.get("home_name") or "Home")
+    away_name = str(item.get("away_name") or "Away")
+    home_center, away_center = 165, 735
+    logo_y, logo_size = 180, 110
+
+    _paste_round_asset(image, _download_asset(item.get("home_logo")), home_center, logo_y, logo_size)
+    _paste_round_asset(image, _download_asset(item.get("away_logo")), away_center, logo_y, logo_size)
+    center(home_name, home_center, 250, fit_text(home_name, 260))
+    center(away_name, away_center, 250, fit_text(away_name, 260))
+
+    score = _sport_score(item)
+    draw.rounded_rectangle((360, 112, 540, 180), radius=17, fill=(16, 36, 42), outline=(43, 69, 72), width=1)
+    center(score, 450, 117, score_font)
+
+    status = _sport_status_label(item)
+    if item.get("status") == "LIVE":
+        pill_fill, pill_text = (18, 160, 96), (245, 255, 249)
+    elif item.get("status") == "FT":
+        pill_fill, pill_text = (61, 79, 85), (239, 246, 247)
+    else:
+        pill_fill, pill_text = (27, 65, 91), (220, 239, 255)
+    bbox = draw.textbbox((0, 0), status, font=status_font)
+    pill_w = max(125, bbox[2] - bbox[0] + 32)
+    draw.rounded_rectangle((450 - pill_w // 2, 195, 450 + pill_w // 2, 230), radius=14, fill=pill_fill)
+    center(status, 450, 200, status_font, pill_text)
+
+    if item.get("status") == "FT" and item.get("winner"):
+        winner = str(item["winner"])
+        center(f"🏆 Winner: {winner}", 450, 268, _get_font(18, bold=True), (231, 244, 239))
+
+    odds_end = _draw_sport_odds(draw, center, item, 325)
+    if odds_end is None:
+        center("Kick-off  •  " + time_text if time_text and item.get("status") == "NS" else "", 450, 325, _get_font(16), (105, 137, 134))
+
+    output = io.BytesIO()
+    output.name = "sport_card.png"
+    image.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
+def _create_sport_tennis_card(item: dict) -> io.BytesIO:
+    width, height = 900, 565
+    image = Image.new("RGB", (width, height))
+    pixels = image.load()
+    top, bottom = (6, 17, 23), (5, 34, 29)
+    for y in range(height):
+        t = y / max(height - 1, 1)
+        r = int(top[0] * (1 - t) + bottom[0] * t)
+        g = int(top[1] * (1 - t) + bottom[1] * t)
+        b = int(top[2] * (1 - t) + bottom[2] * t)
+        for x in range(width):
+            edge = abs(x - width / 2) / (width / 2)
+            glow = int(4 * (1 - edge))
+            pixels[x, y] = (r + glow, g + glow, b + glow)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((4, 4, width - 5, height - 5), radius=24, fill=(7, 24, 28), outline=(42, 67, 70), width=2)
+    draw.rounded_rectangle((26, 15, width - 26, 18), radius=2, fill=(24, 174, 105))
+
+    title = f"🎾 {item.get('tour', 'ATP')} • {item.get('competition', 'Tennis')}"
+    title_font = _get_font(22, bold=True)
+    meta_font = _get_font(18)
+    score_font = _get_font(40, bold=True)
+    status_font = _get_font(16, bold=True)
+    draw.text((30, 35), str(title), fill=(245, 249, 248), font=title_font)
+    header_right = "  •  ".join(x for x in (str(item.get('date') or ''), str(item.get('time') or '')) if x)
+    if header_right:
+        bbox = draw.textbbox((0, 0), header_right, font=meta_font)
+        draw.text((870 - (bbox[2] - bbox[0]), 38), header_right, fill=(190, 208, 207), font=meta_font)
+    draw.line((30, 78, 870, 78), fill=(37, 61, 63), width=1)
+
+    p1, p2 = str(item.get("home_name") or "Player 1"), str(item.get("away_name") or "Player 2")
+    _paste_round_asset(image, _download_asset(item.get("home_logo")), 165, 170, 125)
+    _paste_round_asset(image, _download_asset(item.get("away_logo")), 735, 170, 125)
+
+    def fit_text(text, max_width):
+        for size in range(28, 15, -1):
+            f = _get_font(size, bold=True)
+            if draw.textbbox((0, 0), text, font=f)[2] <= max_width:
+                return f
+        return _get_font(16, bold=True)
+    def center(text, x, y, font, fill=(244, 248, 247)):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        draw.text((x - (bbox[2] - bbox[0]) / 2, y), text, font=font, fill=fill)
+
+    center(f"{item.get('home_country', '')} {p1}".strip(), 165, 245, fit_text(p1, 270))
+    center(f"{item.get('away_country', '')} {p2}".strip(), 735, 245, fit_text(p2, 270))
+
+    score = _sport_score(item)
+    draw.rounded_rectangle((325, 112, 575, 180), radius=17, fill=(16, 36, 42), outline=(43, 69, 72), width=1)
+    center(score, 450, 124, score_font)
+
+    status = _sport_status_label(item)
+    if item.get("status") == "LIVE":
+        pill_fill, pill_text = (18, 160, 96), (245, 255, 249)
+    elif item.get("status") == "FT":
+        pill_fill, pill_text = (61, 79, 85), (239, 246, 247)
+    else:
+        pill_fill, pill_text = (27, 65, 91), (220, 239, 255)
+    bbox = draw.textbbox((0, 0), status, font=status_font)
+    pill_w = max(125, bbox[2] - bbox[0] + 32)
+    draw.rounded_rectangle((450 - pill_w // 2, 195, 450 + pill_w // 2, 230), radius=14, fill=pill_fill)
+    center(status, 450, 200, status_font, pill_text)
+
+    if item.get("winner"):
+        center(f"🏆 Winner: {item['winner']}", 450, 270, _get_font(18, bold=True), (231, 244, 239))
+    if item.get("round"):
+        center(f"🏟 {item['round']}", 450, 298, _get_font(16, bold=True), (139, 166, 163))
+
+    _draw_sport_odds(draw, center, item, 352)
+    output = io.BytesIO()
+    output.name = "tennis_card.png"
+    image.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
+def _create_f1_card(item: dict) -> io.BytesIO:
+    """Compact F1 race card: next session + Top 10 driver rows with photos/odds."""
+    width, height = 900, 1040
+    image = Image.new("RGB", (width, height))
+    pixels = image.load()
+    top, bottom = (5, 16, 22), (5, 32, 28)
+    for y in range(height):
+        t = y / max(height - 1, 1)
+        r = int(top[0] * (1 - t) + bottom[0] * t)
+        g = int(top[1] * (1 - t) + bottom[1] * t)
+        b = int(top[2] * (1 - t) + bottom[2] * t)
+        for x in range(width):
+            edge = abs(x - width / 2) / (width / 2)
+            glow = int(4 * (1 - edge))
+            pixels[x, y] = (r + glow, g + glow, b + glow)
+
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        (4, 4, width - 5, height - 5),
+        radius=24,
+        fill=(7, 24, 28),
+        outline=(42, 67, 70),
+        width=2,
+    )
+    draw.rounded_rectangle((26, 15, width - 26, 19), radius=2, fill=(24, 174, 105))
+
+    title_font = _get_font(24, bold=True)
+    race_font = _get_font(34, bold=True)
+    meta_font = _get_font(16)
+    next_font = _get_font(16, bold=True)
+    label_font = _get_font(14, bold=True)
+    driver_font = _get_font(17, bold=True)
+    points_font = _get_font(14)
+    odds_font = _get_font(16, bold=True)
+
+    # Header — avoid emoji glyphs because they can render as empty squares on
+    # Pillow/Windows font combinations.
+    draw.text((30, 35), "FORMULA 1", fill=(245, 249, 248), font=title_font)
+    draw.text((30, 76), str(item.get("competition") or "Grand Prix"), fill=(238, 246, 243), font=race_font)
+
+    location = " • ".join(
+        x for x in (
+            str(item.get("circuit") or ""),
+            str(item.get("locality") or ""),
+            str(item.get("country") or ""),
+        ) if x
+    )
+    if location:
+        draw.text((30, 116), location, fill=(169, 194, 189), font=meta_font)
+
+    race_date = str(item.get("race_date") or "").strip()
+    race_time = str(item.get("race_time") or "").strip()
+    race_when = " • ".join(x for x in (race_date, race_time) if x)
+    if race_when:
+        draw.text(
+            (30, 137),
+            f"RACE  •  {race_when} Yerevan time",
+            fill=(139, 166, 163),
+            font=_get_font(13, bold=True),
+        )
+
+    # Current stage/status + next session.
+    stage_label = str(item.get("stage") or "Schedule unavailable")
+    stage_detail = str(item.get("stage_detail") or "").strip()
+    draw.text((30, 160), "CURRENT STAGE", fill=(132, 164, 159), font=label_font)
+    draw.text((30, 183), stage_label, fill=(232, 244, 242), font=next_font)
+    if stage_detail:
+        draw.text((30, 204), stage_detail, fill=(169, 194, 189), font=meta_font)
+
+    next_session = item.get("next_session") or {}
+    next_label = str(next_session.get("label") or item.get("stage") or "Schedule unavailable")
+    next_date = str(next_session.get("date") or "")
+    next_time = str(next_session.get("time") or "")
+    draw.text((30, 235), "NEXT SESSION", fill=(132, 164, 159), font=label_font)
+    session_line = next_label
+    if next_date or next_time:
+        session_line += "  •  " + " • ".join(x for x in (next_date, next_time) if x)
+    draw.text((30, 258), session_line, fill=(232, 244, 242), font=next_font)
+
+    # Pit-stop summary is shown from real race data only. Before the race,
+    # explicitly state that no stops exist yet.
+    pit = item.get("pit_stop_summary") or {}
+    pit_y = 295
+    draw.line((30, pit_y, 870, pit_y), fill=(37, 61, 63), width=1)
+    draw.text((30, pit_y + 15), "PIT STOP SUMMARY", fill=(139, 166, 163), font=label_font)
+    pit_status = str(pit.get("status") or "unavailable")
+    if pit_status == "available":
+        pit_line = f"{int(pit.get('total_stops') or 0)} stops • {int(pit.get('drivers') or 0)} drivers"
+        fastest = pit.get("fastest") or {}
+        if fastest.get("duration"):
+            pit_line += f" • Fastest {fastest.get('duration')}"
+    elif str(item.get("stage_status") or "") == "pre_race":
+        pit_line = "Race not started • no pit stops yet"
+    elif str(item.get("stage_status") or "") == "in_progress":
+        pit_line = "Race in progress • pit-stop data pending"
+    else:
+        pit_line = "No pit-stop data available"
+    draw.text((30, pit_y + 38), pit_line, fill=(232, 244, 242), font=meta_font)
+
+    header_y = 355
+    draw.line((30, header_y, 870, header_y), fill=(37, 61, 63), width=1)
+    draw.text((30, header_y + 15), "CHAMPIONSHIP TOP 10", fill=(139, 166, 163), font=label_font)
+    draw.text((650, header_y + 15), "POINTS", fill=(108, 136, 134), font=label_font)
+    odds_column_title = "ODDS · KROK" if item.get("odds_provider") else "RACE ODDS"
+    draw.text((770, header_y + 15), odds_column_title, fill=(108, 136, 134), font=label_font)
+
+    rows = item.get("standings") or []
+    if not any((row.get("odds") or {}).get("price") is not None for row in rows):
+        draw.text(
+            (770, header_y + 32),
+            "NO LINES",
+            fill=(139, 166, 163),
+            font=_get_font(10, bold=True),
+        )
+    y = header_y + 39
+    row_h = 56
+    for row in rows[:10]:
+        position = int(row.get("position") or 0)
+        name = str(row.get("name") or "Driver")
+        pts = str(row.get("points") or "0")
+        photo_url = str(row.get("photo_url") or "").strip()
+        odd = row.get("odds") or {}
+
+        draw.rounded_rectangle(
+            (30, y, 870, y + row_h),
+            radius=11,
+            fill=(10, 31, 36),
+            outline=(29, 54, 57),
+            width=1,
+        )
+
+        # Small circular driver headshot.
+        asset = _download_asset(photo_url) if photo_url else None
+        _paste_round_asset(image, asset, 58, y + row_h // 2, 40)
+
+        draw.text((86, y + 18), f"{position}. {name}", fill=(238, 246, 245), font=driver_font)
+
+        pts_text = f"{pts}"
+        bbox = draw.textbbox((0, 0), pts_text, font=points_font)
+        draw.text((715 - (bbox[2] - bbox[0]), y + 19), pts_text, fill=(164, 187, 183), font=points_font)
+
+        coefficient = "—"
+        bookmaker = ""
+        if odd.get("price") is not None:
+            try:
+                coefficient = f"{float(odd['price']):.2f}"
+            except (TypeError, ValueError):
+                coefficient = "—"
+        bookmaker = str(odd.get("bookmaker") or "").strip()
+        if bookmaker:
+            draw.text(
+                (770, y + 5),
+                bookmaker[:14].upper(),
+                fill=(139, 166, 163),
+                font=_get_font(9, bold=True),
+            )
+        bbox = draw.textbbox((0, 0), coefficient, font=odds_font)
+        draw.text((850 - (bbox[2] - bbox[0]), y + 25), coefficient, fill=(241, 247, 245), font=odds_font)
+
+        y += row_h + 7
+
+    output = io.BytesIO()
+    output.name = "f1_card.png"
+    image.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
+def _create_sport_card(item: dict) -> io.BytesIO:
+    if item.get("type") == "f1":
+        return _create_f1_card(item)
+    if item.get("type") == "player_match":
+        return _create_sport_tennis_card(item)
+    return _create_sport_team_card(item)
+
+
+def _sport_fallback_text(item: dict) -> str:
+    icon = str(item.get("sport_icon") or "🏆")
+    competition = str(item.get("competition") or "Sport")
+    date_text = str(item.get("date") or "")
+    time_text = str(item.get("time") or "")
+    if item.get("type") == "f1":
+        race_when = " • ".join(
+            x for x in (str(item.get("race_date") or ""), str(item.get("race_time") or "")) if x
+        )
+        lines = [
+            "🏎️ Formula 1",
+            "",
+            str(item.get("competition") or "Grand Prix"),
+            " • ".join(x for x in (
+                str(item.get("circuit") or ""), str(item.get("locality") or ""),
+                str(item.get("country") or ""),
+            ) if x),
+            f"🏁 {item.get('stage') or 'Schedule available'}",
+        ]
+        if race_when:
+            lines.append(f"🏎️ Race: {race_when} Yerevan time")
+        if item.get("stage_detail"):
+            lines.append(str(item["stage_detail"]))
+        next_session = item.get("next_session") or {}
+        if next_session.get("label"):
+            lines.append("➡️ Next: " + str(next_session["label"]))
+        for row in (item.get("standings") or [])[:10]:
+            odds = row.get("odds") or {}
+            price = odds.get("price")
+            coefficient = f"{float(price):.2f}" if price is not None else "—"
+            lines.append(f"{row.get('position')}. {row.get('name')} — {row.get('points')} pts • {coefficient}")
+        return "\n".join(lines)
+    lines = [f"{icon} {competition}", "", f"{item.get('home_name')} vs {item.get('away_name')}", _sport_status_label(item)]
+    score = _sport_score(item)
+    if score != "VS":
+        lines.append(score)
+    if item.get("winner"):
+        lines.append(f"🏆 Winner: {item['winner']}")
+    odds = item.get("odds") or {}
+    if odds:
+        bookmaker = str(odds.get("bookmaker") or "").strip()
+        source = f" • {bookmaker}" if bookmaker else ""
+        lines.append(
+            f"💰 Coefficient{source}: "
+            f"{odds.get('left', '—')} / {odds.get('right', '—')}"
+        )
+    when = " • ".join(x for x in (date_text, time_text) if x)
+    if when:
+        lines.append(f"📅 {when}")
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -786,17 +1748,55 @@ async def handle_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if destination == "back_to_previous" and mode == "top":
         await _clear_previous_match_messages(query, context)
-        await _edit_navigation_message(
-            query, context, "⚽ MATCHRADAR\n\n🏆 Choose a league", reply_markup=_league_keyboard(),
-        )
         context.user_data.clear()
+        await _edit_navigation_message(
+            query, context, "🏆 MySportInfo Bot\n\n⚽ What sport would you like to follow?",
+            reply_markup=_sport_keyboard(),
+        )
+        return
+
+    if destination == "back_to_previous" and str(mode or "").startswith("sport_"):
+        sport = context.user_data.get("sport")
+
+        if screen == "sport_period_selection" and sport == "tennis":
+            context.user_data["screen"] = "tennis_tour_selection"
+            await _edit_navigation_message(
+                query,
+                context,
+                "🎾 Tennis\n\n🏆 Choose tour",
+                reply_markup=_tennis_tour_keyboard(),
+            )
+            return
+
+        if screen == "sport_matches" and sport != "f1":
+            await _clear_previous_match_messages(query, context)
+            context.user_data["screen"] = "sport_period_selection"
+            await _edit_navigation_message(
+                query,
+                context,
+                (
+                    f"🎾 Tennis — {str(context.user_data.get('tennis_tour') or 'ATP').upper()}\n\n📅 Choose a period"
+                    if sport == "tennis"
+                    else _sport_period_title(sport, context.user_data.get("period", "today"))
+                ),
+                reply_markup=_sport_period_keyboard(sport),
+            )
+            return
+
+        await _clear_previous_match_messages(query, context)
+        context.user_data.clear()
+        await _edit_navigation_message(
+            query, context, "🏆 MySportInfo Bot\n\n⚽ What sport would you like to follow?",
+            reply_markup=_sport_keyboard(),
+        )
         return
 
     await _clear_previous_match_messages(query, context)
-    await _edit_navigation_message(
-        query, context, "⚽ MATCHRADAR\n\n🏆 Choose a league", reply_markup=_league_keyboard(),
-    )
     context.user_data.clear()
+    await _edit_navigation_message(
+        query, context, "🏆 MySportInfo Bot\n\n⚽ What sport would you like to follow?",
+        reply_markup=_sport_keyboard(),
+    )
 
 
 async def handle_back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -805,10 +1805,11 @@ async def handle_back_to_start(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     await _clear_previous_match_messages(query, context)
-    await _edit_navigation_message(
-        query, context, "⚽ MATCHRADAR\n\n🏆 Choose a league", reply_markup=_league_keyboard(),
-    )
     context.user_data.clear()
+    await _edit_navigation_message(
+        query, context, "🏆 MySportInfo Bot\n\n⚽ What sport would you like to follow?",
+        reply_markup=_sport_keyboard(),
+    )
 
 
 # ============================================================
@@ -820,8 +1821,18 @@ async def handle_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     await query.answer("Refreshing...")
 
-    if not context.user_data.get("mode"):
+    mode = context.user_data.get("mode")
+    if not mode:
         await query.answer("Please start again with /start.", show_alert=True)
+        return
+
+    if str(mode).startswith("sport_"):
+        sport = context.user_data.get("sport")
+        if sport:
+            await _show_sport_matches(
+                query, context, sport, context.user_data.get("period"),
+                context.user_data.get("tennis_tour")
+            )
         return
 
     await _edit_navigation_message(query, context, "⏳ Refreshing...")
@@ -851,13 +1862,7 @@ async def _stop_live_update_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _should_poll_live_matches(matches: list) -> bool:
-    """Poll for live games and games kicking off soon.
-
-    Important: this must NOT require a match to already be LIVE at
-    screen-load time — a match that is still NS but kicks off in the next
-    couple of hours needs polling too, otherwise its SCHEDULED -> LIVE
-    transition (and any postponement) would never be picked up.
-    """
+    """Poll live/near-kickoff matches for score/status changes."""
     if not matches:
         return False
 
@@ -882,36 +1887,71 @@ def _should_poll_live_matches(matches: list) -> bool:
     return False
 
 
+def _has_missing_uefa_odds(matches: list) -> bool:
+    """Return True while a visible UEFA fixture still has no complete 1X2."""
+    if not getattr(api, "THE_ODDS_API_KEY", None):
+        return False
+
+    for match in matches or []:
+        if str(match.get("league_id", "")).upper() not in {"CL", "EL", "ECL"}:
+            continue
+
+        status = str(match.get("status_short", "")).upper()
+        if api.is_finished(status) or api.is_cancelled(status) or api.is_postponed(status):
+            continue
+
+        odds = match.get("odds_1x2") or {}
+        if not all(odds.get(k) is not None for k in ("home", "draw", "away")):
+            return True
+
+    return False
+
+
 async def _start_live_update_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _stop_live_update_loop(context)
 
     matches = context.user_data.get("live_match_snapshot") or []
-    should_poll = _should_poll_live_matches(matches)
+    should_poll_live = _should_poll_live_matches(matches)
+    should_poll_odds = _has_missing_uefa_odds(matches)
     logger.info(
-        "[LIVE] updater start check: screen=%s matches=%d should_poll=%s",
-        context.user_data.get("screen"), len(matches), should_poll,
+        "[UPDATER] start check: screen=%s matches=%d live=%s odds_watch=%s",
+        context.user_data.get("screen"), len(matches), should_poll_live, should_poll_odds,
     )
-    if not should_poll:
-        logger.info("[LIVE] updater NOT started: no live/near-kickoff match")
+
+    if not should_poll_live and not should_poll_odds:
+        logger.info("[UPDATER] NOT started: no live/near-kickoff match and no missing UEFA odds")
         return
 
     context.user_data["live_update_task"] = asyncio.create_task(_live_score_update_loop(context))
-    logger.info("[LIVE] updater task CREATED")
+    logger.info("[UPDATER] task CREATED")
 
 
 async def _live_score_update_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Default is 120s so the free 5Dollar plan keeps enough hourly quota for
-    # initial odds requests. Set LIVE_SCORE_REFRESH_SECONDS=60 in .env if you
-    # deliberately want one live poll per minute.
-    refresh_seconds = max(60, int(getattr(api, "LIVE_SCORE_REFRESH_SECONDS", 120)))
-    logger.info("[LIVE] updater loop running: interval=%ss", refresh_seconds)
+    live_refresh_seconds = max(60, int(getattr(api, "LIVE_SCORE_REFRESH_SECONDS", 120)))
+    # Odds are deliberately refreshed much less often than live scores so the
+    # free The Odds API quota is not burned by minute-by-minute polling.
+    odds_refresh_seconds = max(900, int(os.getenv("ODDS_AUTO_REFRESH_SECONDS", "10800")))
+    logger.info(
+        "[UPDATER] loop running: live_interval=%ss odds_interval=%ss",
+        live_refresh_seconds, odds_refresh_seconds,
+    )
 
     first_cycle = True
+    last_odds_refresh = time.monotonic()
 
     try:
         while context.user_data.get("screen") == "matches":
+            matches = context.user_data.get("live_match_snapshot") or []
+            if not matches:
+                logger.info("[UPDATER] stopping: no matches")
+                break
+
+            should_poll_live = _should_poll_live_matches(matches)
+            should_poll_odds = _has_missing_uefa_odds(matches)
+
             if not first_cycle:
-                await asyncio.sleep(refresh_seconds)
+                sleep_for = live_refresh_seconds if should_poll_live else odds_refresh_seconds
+                await asyncio.sleep(sleep_for)
             first_cycle = False
 
             if context.user_data.get("screen") != "matches":
@@ -920,65 +1960,97 @@ async def _live_score_update_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
             matches = context.user_data.get("live_match_snapshot") or []
             message_ids = context.user_data.get("live_card_message_ids") or []
             if not matches or not message_ids:
-                logger.info("[LIVE] updater stopping: no matches/message ids")
+                logger.info("[UPDATER] stopping: no matches/message ids")
                 break
 
-            logger.info("[LIVE] cycle: checking %d visible card(s)", len(matches))
+            logger.info("[UPDATER] cycle: checking %d visible card(s)", len(matches))
+            changed_indexes = set()
 
-            # Final UI-side safety net. Do this BEFORE api.refresh_live_scores
-            # so a stale LIVE card becomes a changed card even if api.py or
-            # the external status provider still reports LIVE.
-            bot_guard_changed = set()
-            for idx, match in enumerate(matches):
-                if _force_stale_live_status(match):
-                    bot_guard_changed.add(idx)
+            if _should_poll_live_matches(matches):
+                bot_guard_changed = set()
+                for idx, match in enumerate(matches):
+                    if _force_stale_live_status(match):
+                        bot_guard_changed.add(idx)
 
-            changed_indexes = await asyncio.to_thread(api.refresh_live_scores, matches)
-            changed_indexes = set(changed_indexes) | bot_guard_changed
-            logger.info("[LIVE] cycle result: changed=%s", sorted(changed_indexes))
+                live_changed = await asyncio.to_thread(api.refresh_live_scores, matches)
+                changed_indexes |= set(live_changed) | bot_guard_changed
+                logger.info("[LIVE] cycle result: changed=%s", sorted(set(live_changed) | bot_guard_changed))
 
-            # IMPORTANT: render the changed cards BEFORE deciding whether the
-            # polling loop should stop.  A LIVE -> DELAYED / FINISHED /
-            # CANCELLED transition can make _should_poll_live_matches() false;
-            # if we break first, Telegram never receives the final state.
-            should_continue = _should_poll_live_matches(matches)
+            # Retry missing UEFA odds periodically. If a provider publishes a
+            # line later, the already-open Telegram cards get the coefficients
+            # automatically without the user pressing Refresh.
+            now_mono = time.monotonic()
+            if (
+                _has_missing_uefa_odds(matches)
+                and now_mono - last_odds_refresh >= odds_refresh_seconds
+            ):
+                before = []
+                for match in matches:
+                    full = match.get("odds_1x2") or {}
+                    first = match.get("odds_1h_1x2") or {}
+                    before.append((
+                        full.get("home"), full.get("draw"), full.get("away"),
+                        first.get("home"), first.get("draw"), first.get("away"),
+                        full.get("bookmaker"),
+                    ))
 
-            if not changed_indexes:
-                if not should_continue:
-                    break
-                continue
-
-            chat_id = context.user_data.get("chat_id")
-            if chat_id is None:
-                break
-
-            for index in sorted(changed_indexes):
-                if index >= len(message_ids):
-                    continue
-
-                message_id = message_ids[index]
+                logger.info("[ODDS-AUTO] retrying missing UEFA odds")
                 try:
-                    card = _create_match_card(matches[index])
-                    keyboard = _bottom_back_keyboard() if index == len(message_ids) - 1 else None
+                    await asyncio.to_thread(api.enrich_matches_with_odds, matches)
+                except Exception:
+                    logger.exception("[ODDS-AUTO] odds refresh failed")
+                else:
+                    for idx, match in enumerate(matches):
+                        full = match.get("odds_1x2") or {}
+                        first = match.get("odds_1h_1x2") or {}
+                        after = (
+                            full.get("home"), full.get("draw"), full.get("away"),
+                            first.get("home"), first.get("draw"), first.get("away"),
+                            full.get("bookmaker"),
+                        )
+                        if idx < len(before) and after != before[idx]:
+                            changed_indexes.add(idx)
+                            logger.info(
+                                "[ODDS-AUTO] updated: %s vs %s",
+                                match.get("home_team"), match.get("away_team"),
+                            )
+                finally:
+                    last_odds_refresh = time.monotonic()
 
-                    await context.bot.edit_message_media(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        media=InputMediaPhoto(media=InputFile(card, filename="match_card.png")),
-                        reply_markup=keyboard,
-                    )
-                    logger.info("Live card updated: message_id=%s index=%s", message_id, index)
-                except TelegramError:
-                    logger.exception("Could not update live card message %s", message_id)
+            should_continue = _should_poll_live_matches(matches) or _has_missing_uefa_odds(matches)
+
+            if changed_indexes:
+                chat_id = context.user_data.get("chat_id")
+                if chat_id is None:
+                    break
+
+                for index in sorted(changed_indexes):
+                    if index >= len(message_ids):
+                        continue
+
+                    message_id = message_ids[index]
+                    try:
+                        card = _create_match_card(matches[index])
+                        keyboard = _bottom_back_keyboard() if index == len(message_ids) - 1 else None
+
+                        await context.bot.edit_message_media(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            media=InputMediaPhoto(media=InputFile(card, filename="match_card.png")),
+                            reply_markup=keyboard,
+                        )
+                        logger.info("Card updated: message_id=%s index=%s", message_id, index)
+                    except TelegramError:
+                        logger.exception("Could not update card message %s", message_id)
 
             if not should_continue:
-                logger.info("[LIVE] updater stopping: no live/near-kickoff matches remain")
+                logger.info("[UPDATER] stopping: no live/near-kickoff matches and no missing UEFA odds")
                 break
     except asyncio.CancelledError:
-        logger.info("[LIVE] updater cancelled")
+        logger.info("[UPDATER] cancelled")
         raise
     except Exception:
-        logger.exception("[LIVE] updater loop failed")
+        logger.exception("[UPDATER] loop failed")
     finally:
         if context.user_data.get("live_update_task") is asyncio.current_task():
             context.user_data["live_update_task"] = None
@@ -1021,6 +2093,9 @@ def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_sport_selection, pattern=r"^sport:"))
+    application.add_handler(CallbackQueryHandler(handle_tennis_tour_selection, pattern=r"^tennis_tour:"))
+    application.add_handler(CallbackQueryHandler(handle_sport_period_selection, pattern=r"^sport_period:"))
     application.add_handler(CallbackQueryHandler(handle_period_selection, pattern=r"^period:"))
     application.add_handler(CallbackQueryHandler(handle_league_selection, pattern=r"^league:"))
     application.add_handler(CallbackQueryHandler(handle_back_to_leagues, pattern=r"^back_to_leagues$"))
@@ -1030,9 +2105,10 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_back_to_start, pattern=r"^back_to_start$"))
     application.add_error_handler(error_handler)
 
-    logger.info("Football bot is starting...")
+    logger.info("Multi-sport bot is starting...")
     application.run_polling()
 
 
 if __name__ == "__main__":
     main()
+    
