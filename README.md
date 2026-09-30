@@ -1,4 +1,5 @@
-# ⚽ Football Fixtures Telegram Bot
+# 🏆 MatchRadar Sport
+[Open MatchRadar Sport on Telegram]([https://t.me/My_Sport_Info_Bot](https://t.me/My_Sport_Info_Bot))
 
 A Telegram bot that shows football fixtures (today, tomorrow, this week, or
 this month) for the top European leagues, using live data from the
