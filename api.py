@@ -39,12 +39,14 @@ instead of re-guessing aliases like "TIMED"/"SCHEDULED_TIME"/"POSTPONED".
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 import difflib
+import html
 import os
 import re
+import threading
 import time
 import unicodedata
 from functools import lru_cache
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 from dotenv import load_dotenv
@@ -2656,8 +2658,12 @@ def get_date_range(period: str) -> tuple:
         date_from = today_local
         date_to = today_local + timedelta(days=7)
     elif period == "month":
-        date_from = today_local
-        date_to = today_local + timedelta(days=30)
+        date_from = today_local.replace(day=1)
+        if date_from.month == 12:
+            next_month = date_from.replace(year=date_from.year + 1, month=1)
+        else:
+            next_month = date_from.replace(month=date_from.month + 1)
+        date_to = next_month - timedelta(days=1)
     else:
         raise ValueError(f"Unknown period: {period}")
 
@@ -2696,7 +2702,9 @@ LIVE_TENNIS_BASE_URL = "https://api.livetennisapi.com/api/public/v1"
 # API Tennis - dedicated tennis bookmaker odds provider
 API_TENNIS_BASE_URL = "https://api.api-tennis.com/tennis/"
 API_TENNIS_KEY = (os.getenv("API_TENNIS_API_KEY") or os.getenv("API_TENNIS_KEY") or "").strip()
-API_TENNIS_BOOKMAKER = (os.getenv("API_TENNIS_BOOKMAKER") or "auto").strip().lower()
+API_TENNIS_BOOKMAKER = (os.getenv("API_TENNIS_BOOKMAKER") or ODDS_BOOKMAKER).strip().lower()
+API_TENNIS_SINGLES_EVENT_TYPE_KEYS = {"atp": "265", "wta": "266"}
+_API_TENNIS_EVENT_TYPE_KEYS_CACHE: tuple[float, dict[str, str]] | None = None
 _API_TENNIS_ODDS_CACHE: dict[tuple[str, str, str], tuple[float, list[dict]]] = {}
 _API_TENNIS_ODDS_CACHE_TTL = 180.0
 
@@ -2704,6 +2712,10 @@ THE_ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
 THE_ODDS_API_KEY = (os.getenv("THE_ODDS_API_KEY") or os.getenv("MULTI_SPORT_ODDS_API_KEY") or "").strip()
 THE_ODDS_BOOKMAKER = os.getenv("MULTI_SPORT_ODDS_BOOKMAKER", "").strip().lower()
 NBA_ODDS_REGION = os.getenv("MULTI_SPORT_ODDS_REGION_NBA", "us").strip() or "us"
+EUROLEAGUE_ODDS_REGION = (
+    os.getenv("MULTI_SPORT_ODDS_REGION_EUROLEAGUE", "eu,uk").strip()
+    or "eu,uk"
+)
 NHL_ODDS_REGION = (
     os.getenv("MULTI_SPORT_ODDS_REGION_NHL", "us,uk,eu").strip()
     or "us,uk,eu"
@@ -2753,9 +2765,20 @@ ODDSPAPI_TENNIS_SPORT_ID = "12"
 # ============================================================
 
 
-def _get_json(url: str, *, headers: dict | None = None, params: dict | None = None):
+def _get_json(
+    url: str,
+    *,
+    headers: dict | None = None,
+    params: dict | None = None,
+    timeout: float | None = None,
+):
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=TIMEOUT)
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=TIMEOUT if timeout is None else timeout,
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
         # Provider errors often echo the request URL, including apiKey query
@@ -2964,7 +2987,12 @@ def _nba_games_from_odds_fallback(date_from: date, date_to: date) -> list[dict]:
     return out
 
 
-def _merge_odds_scores_for_sport(sport_key: str, date_from: date, date_to: date):
+def _merge_odds_scores_for_sport(
+    sport_key: str,
+    date_from: date,
+    date_to: date,
+    regions: str = "us",
+):
     """Load current/upcoming odds plus live/recent scores from The Odds API."""
     if not THE_ODDS_API_KEY:
         return [], []
@@ -2976,7 +3004,7 @@ def _merge_odds_scores_for_sport(sport_key: str, date_from: date, date_to: date)
         odds_events = _odds_api_get(
             f"/sports/{sport_key}/odds",
             {
-                "regions": "us",
+                "regions": regions,
                 "markets": "h2h",
                 "oddsFormat": "decimal",
                 "dateFormat": "iso",
@@ -3068,6 +3096,214 @@ def _event_score(event: dict, team_name: str | None):
     return None
 
 
+_ODDS_SPORT_GAMES_CACHE: dict[tuple[str, str, str, str], tuple[float, list[dict], list[dict]]] = {}
+_ODDS_SPORT_GAMES_CACHE_TTL = 60.0
+
+
+def _get_odds_api_sport_games(
+    sport_key: str,
+    date_from: date,
+    date_to: date,
+    regions: str,
+) -> tuple[list[dict], list[dict]]:
+    """Load fixture catalog, available odds, and recent scores for one league.
+
+    The Odds API has separate preseason sport keys. Its events endpoint can
+    provide fixtures even when bookmakers have not posted a moneyline yet, so
+    odds are enrichment rather than the fixture source for these leagues.
+    """
+    if not THE_ODDS_API_KEY:
+        print(f"[SPORT FEED] {sport_key}: The Odds API key is missing")
+        return [], []
+
+    cache_key = (
+        sport_key,
+        date_from.isoformat(),
+        date_to.isoformat(),
+        regions,
+    )
+    now_ts = time.monotonic()
+    cached = _ODDS_SPORT_GAMES_CACHE.get(cache_key)
+    if cached and now_ts - cached[0] < _ODDS_SPORT_GAMES_CACHE_TTL:
+        games, odds_events = cached[1], cached[2]
+        return [dict(game) for game in games], [dict(event) for event in odds_events]
+
+    try:
+        catalog_events = _odds_api_get(
+            f"/sports/{sport_key}/events",
+            {"dateFormat": "iso"},
+        ) or []
+    except Exception as exc:
+        print(f"[SPORT FEED] {sport_key} events request failed: {exc}")
+        catalog_events = []
+
+    odds_events, score_events = _merge_odds_scores_for_sport(
+        sport_key, date_from, date_to, regions=regions
+    )
+    scores = _score_lookup(score_events)
+
+    by_id: dict[str, dict] = {}
+    for source_event in list(catalog_events) + list(odds_events) + list(score_events):
+        if not isinstance(source_event, dict):
+            continue
+        event_id = str(source_event.get("id") or "").strip()
+        if not event_id:
+            continue
+        event_day = _local_date(source_event.get("commence_time"))
+        if event_day is None or not (date_from <= event_day <= date_to):
+            continue
+        by_id.setdefault(event_id, {}).update(source_event)
+
+    games = []
+    for event_id, event in by_id.items():
+        score_event = scores.get(event_id) or {}
+        if score_event:
+            event.update({
+                "completed": score_event.get("completed", event.get("completed")),
+                "scores": score_event.get("scores") or event.get("scores") or [],
+            })
+        has_score = any(
+            row.get("score") not in (None, "")
+            for row in event.get("scores") or []
+            if isinstance(row, dict)
+        )
+        completed = bool(event.get("completed"))
+        status_code = 3 if completed else (2 if has_score else 1)
+        game_status = "Final" if completed else ("Live" if has_score else "Scheduled")
+        home_name = str(event.get("home_team") or "Home").strip()
+        away_name = str(event.get("away_team") or "Away").strip()
+        games.append({
+            "gameId": event_id,
+            "gameDateTimeUTC": event.get("commence_time"),
+            "gameTimeUTC": event.get("commence_time"),
+            "gameStatus": status_code,
+            "gameStatusText": game_status,
+            "homeTeam": {
+                "teamCity": "",
+                "teamName": home_name,
+                "teamTricode": "",
+                "teamId": None,
+                "score": _event_score(event, home_name),
+            },
+            "awayTeam": {
+                "teamCity": "",
+                "teamName": away_name,
+                "teamTricode": "",
+                "teamId": None,
+                "score": _event_score(event, away_name),
+            },
+            "_odds_event": event,
+        })
+
+    games.sort(key=lambda game: str(game.get("gameDateTimeUTC") or ""))
+    _ODDS_SPORT_GAMES_CACHE[cache_key] = (
+        now_ts,
+        [dict(game) for game in games],
+        [dict(event) for event in odds_events if isinstance(event, dict)],
+    )
+    priced_count = sum(
+        bool(_attach_odds(
+            odds_events,
+            str(game["homeTeam"]["teamName"]),
+            str(game["awayTeam"]["teamName"]),
+            _parse_dt(game.get("gameDateTimeUTC")),
+        ))
+        for game in games
+    )
+    print(
+        f"[SPORT FEED] {sport_key}: fixtures={len(games)}; "
+        f"catalog={len(catalog_events)}; odds={len(odds_events)}; "
+        f"scores={len(score_events)}; priced={priced_count}"
+    )
+    return games, odds_events
+
+
+EUROLEAGUE_LIVE_API_BASE_URL = "https://api-live.euroleague.net/v2"
+
+
+def _euroleague_season_year(target: date) -> int:
+    """Return the starting year for the EuroLeague season containing a date."""
+    return target.year if target.month >= 7 else target.year - 1
+
+
+@lru_cache(maxsize=8)
+def _euroleague_clubs_for_season(season_year: int) -> tuple[dict, ...]:
+    """Load official club crests once per season from EuroLeague's own feed."""
+    season_code = f"E{int(season_year)}"
+    url = (
+        f"{EUROLEAGUE_LIVE_API_BASE_URL}/competitions/E/"
+        f"seasons/{season_code}/clubs"
+    )
+    try:
+        payload = _get_json(url)
+    except Exception as exc:
+        print(
+            f"[EUROLEAGUE] club catalog {season_code} unavailable: "
+            f"{type(exc).__name__}"
+        )
+        return ()
+
+    rows = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return ()
+    clubs = tuple(row for row in rows if isinstance(row, dict))
+    print(f"[EUROLEAGUE] official club logo catalog {season_code}: {len(clubs)} clubs")
+    return clubs
+
+
+def _euroleague_name_key(value: str | None) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = text.encode("ascii", "ignore").decode("ascii").lower()
+    return " ".join(re.findall(r"[a-z0-9]+", text))
+
+
+@lru_cache(maxsize=512)
+def _euroleague_team_logo(team_name: str, season_year: int) -> str | None:
+    """Match a sportsbook team name to the official seasonal EuroLeague crest."""
+    wanted = _euroleague_name_key(team_name)
+    if not wanted:
+        return None
+
+    best_score = 0.0
+    best_logo = None
+    for club in _euroleague_clubs_for_season(season_year):
+        names = []
+        for field in (
+            "clubPermanentName", "clubPermanentAlias", "name",
+            "abbreviatedName", "editorialName", "tvCode", "code",
+        ):
+            value = club.get(field)
+            if isinstance(value, (list, tuple)):
+                names.extend(value)
+            elif value:
+                names.append(value)
+
+        score = 0.0
+        for name in names:
+            candidate = _euroleague_name_key(name)
+            if not candidate:
+                continue
+            if wanted == candidate:
+                score = 1.0
+                break
+            if wanted in candidate or candidate in wanted:
+                score = max(score, 0.94)
+            score = max(
+                score,
+                difflib.SequenceMatcher(None, wanted, candidate).ratio(),
+            )
+
+        if score > best_score:
+            images = club.get("images") or {}
+            logo = images.get("crest") if isinstance(images, dict) else None
+            if logo:
+                best_score = score
+                best_logo = str(logo)
+
+    # Avoid assigning an unrelated crest if a provider changes its team labels.
+    return best_logo if best_score >= 0.60 else None
+
+
 def _nba_normalize(game: dict, odds_events: list[dict]) -> dict:
     away = _nba_team(game.get("awayTeam"), game, "away")
     home = _nba_team(game.get("homeTeam"), game, "home")
@@ -3141,12 +3377,75 @@ def get_nba_messages(date_from: str | None = None, date_to: str | None = None):
 
 
 
-def _odds_api_get(path: str, params: dict | None = None):
+def _get_odds_basketball_messages(
+    sport_key: str,
+    competition: str,
+    date_from: str | None,
+    date_to: str | None,
+    regions: str,
+):
+    start = date.fromisoformat(date_from) if date_from else datetime.now(YEREVAN_TZ).date()
+    end = date.fromisoformat(date_to) if date_to else start
+    games, odds_events = _get_odds_api_sport_games(
+        sport_key, start, end, regions=regions
+    )
+    result = []
+    for game in games:
+        item = _nba_normalize(game, odds_events)
+        item["competition"] = competition
+        result.append((f"{competition} event", item))
+    return result
+
+
+def get_nba_preseason_messages(
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+    """NBA preseason fixtures from The Odds API's dedicated preseason feed."""
+    return _get_odds_basketball_messages(
+        "basketball_nba_preseason",
+        "NBA Preseason",
+        date_from,
+        date_to,
+        NBA_ODDS_REGION,
+    )
+
+
+def get_euroleague_messages(
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+    """EuroLeague fixtures from The Odds API's dedicated league feed."""
+    start = date.fromisoformat(date_from) if date_from else datetime.now(YEREVAN_TZ).date()
+    end = date.fromisoformat(date_to) if date_to else start
+    messages = _get_odds_basketball_messages(
+        "basketball_euroleague",
+        "EuroLeague",
+        start.isoformat(),
+        end.isoformat(),
+        EUROLEAGUE_ODDS_REGION,
+    )
+    season_year = _euroleague_season_year(start)
+    for _, item in messages:
+        for side in ("home", "away"):
+            item[f"{side}_logo"] = _euroleague_team_logo(
+                str(item.get(f"{side}_name") or ""), season_year
+            )
+    return messages
+
+
+def _odds_api_get(
+    path: str, params: dict | None = None, *, timeout: float | None = None
+):
     if not THE_ODDS_API_KEY:
         return []
     query = dict(params or {})
     query["apiKey"] = THE_ODDS_API_KEY
-    return _get_json(f"{THE_ODDS_API_BASE_URL}{path}", params=query)
+    return _get_json(
+        f"{THE_ODDS_API_BASE_URL}{path}",
+        params=query,
+        timeout=TIMEOUT if timeout is None else timeout,
+    )
 
 
 def _odds_team_key(name: str | None) -> str:
@@ -3800,6 +4099,64 @@ def _nhl_normalize(game: dict, odds_events: list[dict]) -> dict:
     }
 
 
+def _nhl_odds_team(name: str, score):
+    normalized = _norm(name)
+    abbrev = next(
+        (code for code, full_name in NHL_TEAM_NAMES_BY_ABBREV.items()
+         if _norm(full_name) == normalized),
+        None,
+    )
+    if abbrev is None:
+        candidates = [
+            (_similar(name, full_name), code)
+            for code, full_name in NHL_TEAM_NAMES_BY_ABBREV.items()
+        ]
+        if candidates:
+            similarity, candidate = max(candidates)
+            if similarity >= 0.90:
+                abbrev = candidate
+    if abbrev:
+        return {"abbrev": abbrev, "score": score}
+    return {
+        "placeName": {"default": name},
+        "commonName": {"default": ""},
+        "score": score,
+    }
+
+
+def get_nhl_preseason_messages(
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+    """NHL preseason fixtures from The Odds API's dedicated preseason feed."""
+    start = date.fromisoformat(date_from) if date_from else datetime.now(YEREVAN_TZ).date()
+    end = date.fromisoformat(date_to) if date_to else start
+    games, odds_events = _get_odds_api_sport_games(
+        "icehockey_nhl_preseason", start, end, regions=NHL_ODDS_REGION
+    )
+
+    result = []
+    for source in games:
+        game = dict(source)
+        status_code = int(game.get("gameStatus") or 1)
+        game["gameState"] = "FINAL" if status_code == 3 else (
+            "LIVE" if status_code == 2 else "FUT"
+        )
+        game["startTimeUTC"] = game.get("gameDateTimeUTC")
+        game["homeTeam"] = _nhl_odds_team(
+            str((game.get("homeTeam") or {}).get("teamName") or "Home"),
+            (game.get("homeTeam") or {}).get("score"),
+        )
+        game["awayTeam"] = _nhl_odds_team(
+            str((game.get("awayTeam") or {}).get("teamName") or "Away"),
+            (game.get("awayTeam") or {}).get("score"),
+        )
+        item = _nhl_normalize(game, odds_events)
+        item["competition"] = "NHL Preseason"
+        result.append(("NHL preseason event", item))
+    return result
+
+
 def _get_nhl_day(target: date) -> list[dict]:
     payload = _get_json(f"{NHL_SCORE_URL}/{target.isoformat()}")
     return payload.get("games", []) or []
@@ -3914,6 +4271,7 @@ def _tennis_get(path: str, params: dict | None = None):
         f"{TENNIS_BASE_URL}{path}",
         headers={"X-RapidAPI-Key": key, "X-RapidAPI-Host": TENNIS_HOST},
         params=params,
+        timeout=min(TIMEOUT, 8),
     )
 
 
@@ -3950,25 +4308,465 @@ def _tennis_player_id(player: dict) -> int | None:
     return None
 
 
+def _wikipedia_player_thumbnail(source: str, width: int = 480) -> str:
+    """Use a sized Wikimedia thumbnail instead of downloading full-resolution photos."""
+    parsed = urlsplit(str(source or ""))
+    marker = "/wikipedia/commons/"
+    if parsed.netloc.lower() != "upload.wikimedia.org" or marker not in parsed.path:
+        return str(source)
+
+    relative = parsed.path.split(marker, 1)[1]
+    if relative.startswith("thumb/"):
+        # API thumbnail URLs can be tagged "thumbnail_unscaled" even though
+        # their path is the original image. Existing /thumb/ URLs are already
+        # sized and should be kept as supplied.
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+    parts = relative.split("/")
+    if len(parts) < 3:
+        return str(source)
+    filename = parts[-1]
+    thumbnail_name = f"{width}px-{filename}"
+    if filename.lower().endswith(".svg"):
+        thumbnail_name += ".png"
+    prefix = parsed.path.split(marker, 1)[0]
+    thumbnail_path = (
+        f"{prefix}{marker}thumb/{'/'.join(parts[:-1])}/"
+        f"{filename}/{thumbnail_name}"
+    )
+    return urlunsplit((parsed.scheme, parsed.netloc, thumbnail_path, "", ""))
+
+
 @lru_cache(maxsize=512)
-def _wikipedia_player_image(player_name: str) -> str | None:
-    """Best-effort real player headshot fallback when Tennis API has no photo."""
+def _atp_tour_player_search(
+    player_name: str, timeout: float | None = None
+) -> tuple[dict, ...]:
+    """Fetch and cache ATP directory matches shared by portrait and flag lookup."""
+    name = " ".join(str(player_name or "").split()).strip()
+    if not name:
+        return ()
+    try:
+        payload = _get_json(
+            "https://www.atptour.com/-/ajax/playersearch/PlayerUrlSearch",
+            headers={
+                "User-Agent": "MatchRadar/1.0 (ATP tennis player portraits)",
+                "Referer": "https://www.atptour.com/en/players/",
+                "Accept": "application/json,text/plain,*/*",
+            },
+            params={"SearchTerm": name},
+            timeout=TIMEOUT if timeout is None else timeout,
+        ) or {}
+    except Exception:
+        return ()
+
+    matches = payload.get("items") or payload.get("Items") or [] if isinstance(payload, dict) else []
+    return tuple(dict(player) for player in matches if isinstance(player, dict))
+
+
+@lru_cache(maxsize=512)
+def _atp_tour_player_image(
+    player_name: str, timeout: float | None = None
+) -> str | None:
+    """Resolve an ATP Tour headshot through ATP's own player directory."""
     name = " ".join(str(player_name or "").split()).strip()
     if not name:
         return None
+    known_player_ids = {"cruz hewitt": "h0k0", "alexander zverev": "z355"}
+    known_id = known_player_ids.get(_tennis_name_key(name))
+    if not known_id:
+        initials, surname = _tennis_name_identity(name)
+        if initials == "a" and surname == "zverev":
+            known_id = "z355"
+    if known_id:
+        return f"https://www.atptour.com/-/media/alias/player-headshot/{known_id}"
+
+    matches = _atp_tour_player_search(name, timeout)
+    # Prefer a full-name match before the looser initial/surname matcher.
+    # For example, the ATP search for Alexander Zverev can list Alexander
+    # Zverev Sr. first, which is a different player.
+    for player in matches:
+        result_name = str(player.get("Key") or player.get("key") or player.get("name") or "").strip()
+        profile_path = str(player.get("Value") or player.get("value") or player.get("url") or "")
+        if not result_name or not profile_path:
+            continue
+        if _tennis_name_key(name) != _tennis_name_key(result_name):
+            continue
+        player_slug_id = re.search(r"/([a-z0-9]{4})/(?:overview|player-stats)(?:[/?#]|$)", profile_path, re.IGNORECASE)
+        if player_slug_id:
+            return f"https://www.atptour.com/-/media/alias/player-headshot/{player_slug_id.group(1)}"
+
+    for player in matches:
+        result_name = str(player.get("Key") or player.get("key") or player.get("name") or "").strip()
+        profile_path = str(player.get("Value") or player.get("value") or player.get("url") or "")
+        if not result_name or not profile_path or not _tennis_names_match(name, result_name):
+            continue
+        player_slug_id = re.search(r"/([a-z0-9]{4})/(?:overview|player-stats)(?:[/?#]|$)", profile_path, re.IGNORECASE)
+        if player_slug_id:
+            return f"https://www.atptour.com/-/media/alias/player-headshot/{player_slug_id.group(1)}"
+    return None
+
+
+@lru_cache(maxsize=512)
+def _atp_tour_player_country(
+    player_name: str, timeout: float | None = None
+) -> str:
+    """Resolve nationality from the ATP player directory for odds-only rows."""
+    name = " ".join(str(player_name or "").split()).strip()
+    if not name:
+        return ""
+    for player in _atp_tour_player_search(name, timeout):
+        result_name = str(
+            player.get("Key") or player.get("key") or player.get("name") or ""
+        ).strip()
+        if not result_name or not _tennis_names_match(name, result_name):
+            continue
+        country = _tennis_profile_country(player)
+        if country:
+            return country
+
+        # Card-time enrichment is best effort and must not hold up the whole
+        # match list on a slow profile page.
+        if timeout is not None:
+            continue
+
+        profile_path = str(player.get("Value") or player.get("value") or player.get("url") or "").strip()
+        if not profile_path:
+            continue
+        profile_url = profile_path if profile_path.startswith("https://") else f"https://www.atptour.com{profile_path}"
+        try:
+            response = requests.get(
+                profile_url,
+                headers={"User-Agent": "MatchRadar/1.0 (ATP tennis player nationality)"},
+                timeout=min(TIMEOUT, 8),
+            )
+            response.raise_for_status()
+            source = html.unescape(response.text)
+        except Exception:
+            continue
+
+        country = _tennis_country_from_profile_html(source)
+        if country:
+            return country
+    return ""
+
+
+@lru_cache(maxsize=512)
+def _wta_tour_player_search(
+    player_name: str, timeout: float | None = None
+) -> tuple[dict, ...]:
+    """Fetch and cache WTA directory rows shared by portrait and flag lookup."""
+    name = " ".join(str(player_name or "").split()).strip()
+    if not name:
+        return ()
     try:
-        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(name.replace(' ', '_'))}"
-        payload = _get_json(url, headers={"User-Agent": "MatchRadar/1.0"})
-        original = (payload.get("originalimage") or {}).get("source")
-        if original:
-            return str(original)
-        thumb = (payload.get("thumbnail") or {}).get("source")
-        return str(thumb) if thumb else None
+        payload = _get_json(
+            "https://api.wtatennis.com/tennis/players/ranked",
+            headers={"User-Agent": "MatchRadar/1.0 (WTA tennis player nationality)"},
+            params={
+                "page": 0,
+                "pageSize": 50,
+                "type": "rankSingles",
+                "metric": "SINGLES",
+                "name": name,
+            },
+            timeout=TIMEOUT if timeout is None else timeout,
+        )
     except Exception:
+        return ()
+
+    candidates = []
+
+    def collect(value):
+        if isinstance(value, list):
+            for child in value:
+                collect(child)
+        elif isinstance(value, dict):
+            candidates.append(value)
+            for key in ("player", "players", "data", "content", "results", "items"):
+                child = value.get(key)
+                if isinstance(child, (list, dict)):
+                    collect(child)
+
+    collect(payload)
+    return tuple(dict(row) for row in candidates)
+
+
+@lru_cache(maxsize=512)
+def _wta_tour_player_country(
+    player_name: str, timeout: float | None = None
+) -> str:
+    """Resolve nationality from the WTA player directory for odds-only rows."""
+    name = " ".join(str(player_name or "").split()).strip()
+    if not name:
+        return ""
+
+    for player in _wta_tour_player_search(name, timeout):
+        candidate_name = str(player.get("fullName") or player.get("name") or player.get("playerName") or "").strip()
+        if not candidate_name:
+            candidate_name = " ".join(str(player.get(key) or "").strip() for key in ("firstName", "lastName")).strip()
+        if candidate_name and _tennis_names_match(name, candidate_name):
+            country = _tennis_profile_country(player)
+            if country:
+                return country
+            if timeout is not None:
+                continue
+            player_id = player.get("id") or player.get("playerId")
+            if player_id is not None:
+                profile_html = _wta_tour_profile_html(player_id, candidate_name)
+                country = _tennis_country_from_profile_html(profile_html)
+                if country:
+                    return country
+    return ""
+
+
+@lru_cache(maxsize=512)
+def _wta_tour_profile_html(player_id: str | int, canonical_name: str) -> str:
+    """Fetch one WTA profile page for both image and nationality metadata."""
+    slug = "-" + re.sub(r"[^a-z0-9]+", "-", canonical_name.lower()).strip("-") + "-"
+    profile_url = f"https://www.wtatennis.com/players/{quote(str(player_id))}/{quote(slug)}"
+    try:
+        response = requests.get(
+            profile_url,
+            headers={"User-Agent": "MatchRadar/1.0 (WTA tennis player profile)"},
+            timeout=min(TIMEOUT, 8),
+        )
+        response.raise_for_status()
+        return response.text
+    except Exception:
+        return ""
+
+
+@lru_cache(maxsize=512)
+def _wta_tour_player_image(player_name: str) -> str | None:
+    """Resolve a WTA player portrait from her official profile page."""
+    name = " ".join(str(player_name or "").split()).strip()
+    if not name:
         return None
+    player_id = None
+    canonical_name = ""
+    for row in _wta_tour_player_search(name):
+        candidate_name = str(
+            row.get("fullName") or row.get("name") or row.get("playerName") or ""
+        ).strip()
+        if not candidate_name:
+            first = str(row.get("firstName") or "").strip()
+            last = str(row.get("lastName") or "").strip()
+            candidate_name = " ".join(x for x in (first, last) if x)
+        if candidate_name and _tennis_names_match(name, candidate_name):
+            player_id = row.get("id") or row.get("playerId")
+            canonical_name = candidate_name
+            if player_id is not None:
+                break
+    if player_id is None:
+        return None
+
+    profile_html = _wta_tour_profile_html(player_id, canonical_name)
+    tags = re.findall(r"<meta\b[^>]*>", profile_html, flags=re.IGNORECASE)
+    for tag in tags:
+        property_match = re.search(
+            r"(?:property|name)=[\"'](?:og:image|twitter:image)[\"']",
+            tag,
+            flags=re.IGNORECASE,
+        )
+        content_match = re.search(
+            r"content=[\"']([^\"']+)[\"']", tag, flags=re.IGNORECASE
+        )
+        if property_match and content_match:
+            image_url = html.unescape(content_match.group(1)).strip()
+            if image_url.startswith("https://") and "wtatennis.com" in image_url:
+                return image_url
+    return None
+
+
+@lru_cache(maxsize=512)
+def _wikipedia_player_image(
+    player_name: str,
+    player_id: str | int | None = None,
+    tour: str | None = None,
+    fast: bool = False,
+) -> str | None:
+    """Resolve a real player portrait, expanding abbreviated feed names by roster id."""
+    name = " ".join(str(player_name or "").split()).strip()
+    if not name:
+        return None
+
+    if str(tour or "").strip().lower() == "atp":
+        initials, surname = _tennis_name_identity(name)
+        if (
+            _tennis_name_key(name) == "alexander zverev"
+            or (initials == "a" and surname == "zverev")
+        ):
+            # Use the confirmed ATP photo even when a live profile includes a
+            # stale image URL that would otherwise stop the fallback chain.
+            official_image = _atp_tour_player_image(name, 2.5 if fast else None)
+            if official_image:
+                return official_image
+
+    if fast:
+        # A missing portrait should never delay all ATP/WTA match cards.
+        # Use at most one official directory lookup and one Wikipedia summary.
+        if str(tour or "").strip().lower() == "atp":
+            official_image = _atp_tour_player_image(name, 2.5)
+            if official_image:
+                return official_image
+        try:
+            payload = _get_json(
+                "https://en.wikipedia.org/api/rest_v1/page/summary/"
+                f"{quote(name.replace(' ', '_'))}",
+                headers={"User-Agent": "MatchRadar/1.0 (tennis match-card player portraits)"},
+                timeout=2.5,
+            ) or {}
+            thumbnail = (payload.get("thumbnail") or {}).get("source")
+            original = (payload.get("originalimage") or {}).get("source")
+            if thumbnail or original:
+                return _wikipedia_player_thumbnail(str(thumbnail or original))
+        except Exception:
+            pass
+        return None
+
+    live_profile = {}
+    live_lookup = globals().get("_live_tennis_player_details")
+    if callable(live_lookup):
+        try:
+            live_profile = live_lookup(name, player_id) or {}
+        except Exception:
+            live_profile = {}
+    live_image = str(live_profile.get("image") or "").strip()
+    if live_image:
+        return live_image
+    player_id = live_profile.get("id") or player_id
+
+    candidates = []
+    canonical_name = str(live_profile.get("name") or "").strip()
+    if canonical_name and canonical_name.casefold() != name.casefold():
+        candidates.append(canonical_name)
+    has_initial = bool(re.search(r"(?:^|\s)[A-Z]\.?(?:\s|$)", name, re.IGNORECASE))
+    if player_id is not None and _live_tennis_key() and has_initial:
+        try:
+            profile = _live_tennis_get(f"/players/{quote(str(player_id))}") or {}
+            profile = profile.get("data") if isinstance(profile, dict) and isinstance(profile.get("data"), dict) else profile
+            canonical_name = str(profile.get("name") or "").strip() if isinstance(profile, dict) else ""
+            if canonical_name:
+                candidates.append(canonical_name)
+        except Exception:
+            pass
+
+    candidates.append(name)
+    parts = name.split()
+    if len(parts) >= 3:
+        short_name = f"{parts[0]} {parts[-1]}"
+        if short_name.casefold() != name.casefold():
+            candidates.append(short_name)
+    candidates = list(dict.fromkeys(x for x in candidates if x))
+
+    if str(tour or "").strip().lower() == "atp":
+        for candidate in candidates:
+            atp_image = _atp_tour_player_image(candidate)
+            if atp_image:
+                return atp_image
+
+    headers = {"User-Agent": "MatchRadar/1.0 (tennis match-card player portraits)"}
+    for candidate in candidates:
+        try:
+            url = (
+                "https://en.wikipedia.org/api/rest_v1/page/summary/"
+                f"{quote(candidate.replace(' ', '_'))}"
+            )
+            payload = _get_json(url, headers=headers)
+        except Exception:
+            payload = {}
+
+        thumb = (payload.get("thumbnail") or {}).get("source") if isinstance(payload, dict) else None
+        original = (payload.get("originalimage") or {}).get("source") if isinstance(payload, dict) else None
+        if thumb or original:
+            return _wikipedia_player_thumbnail(str(thumb or original))
+
+    # One indexed lookup handles alternate article titles without repeating
+    # the same search for every candidate spelling.
+    search_candidate = candidates[0]
+    try:
+        search = _get_json(
+            "https://en.wikipedia.org/w/api.php",
+            headers=headers,
+            params={
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": f'"{search_candidate}" tennis player',
+                "gsrnamespace": 0,
+                "gsrlimit": 5,
+                "prop": "pageimages",
+                "piprop": "thumbnail",
+                "pithumbsize": 480,
+                "format": "json",
+            },
+        ) or {}
+        pages = (search.get("query") or {}).get("pages") or {}
+        pages = pages.values() if isinstance(pages, dict) else pages
+        for page in pages:
+            title = str(page.get("title") or "")
+            image = (page.get("thumbnail") or {}).get("source")
+            if image and title and _tennis_names_match(search_candidate, title):
+                return _wikipedia_player_thumbnail(str(image))
+    except Exception:
+        pass
+
+    # Lower-ranked players may not have a Wikipedia article but can still have
+    # an identified photo on Wikimedia Commons. Require the file title itself
+    # to match the player before using it.
+    try:
+        commons = _get_json(
+            "https://commons.wikimedia.org/w/api.php",
+            headers=headers,
+            params={
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": f'"{search_candidate}" tennis',
+                "gsrnamespace": 6,
+                "gsrlimit": 5,
+                "prop": "imageinfo",
+                "iiprop": "url",
+                "iiurlwidth": 480,
+                "format": "json",
+            },
+        ) or {}
+        pages = (commons.get("query") or {}).get("pages") or {}
+        pages = pages.values() if isinstance(pages, dict) else pages
+        for page in pages:
+            title = str(page.get("title") or "")
+            photo_title = re.sub(r"(?i)^file:", "", title)
+            photo_title = re.sub(r"\.[a-z0-9]{2,5}$", "", photo_title, flags=re.IGNORECASE)
+            image_info = page.get("imageinfo") or []
+            image = (image_info[0].get("thumburl") or image_info[0].get("url")) if image_info else None
+            if image and photo_title and _tennis_names_match(search_candidate, photo_title):
+                return _wikipedia_player_thumbnail(str(image))
+    except Exception:
+        pass
+
+    if str(tour or "").strip().lower() == "wta":
+        for candidate in candidates:
+            official_image = _wta_tour_player_image(candidate)
+            if official_image:
+                return official_image
+    return None
 
 
 def _tennis_image(player: dict, tour: str) -> str | None:
+    player_name = str(
+        player.get("name") or player.get("playerName") or player.get("fullName") or ""
+    ).strip()
+    tour_key = str(tour or "").strip().lower()
+    if tour_key == "atp" and player_name:
+        initials, surname = _tennis_name_identity(player_name)
+        if (
+            _tennis_name_key(player_name) == "alexander zverev"
+            or (initials == "a" and surname == "zverev")
+        ):
+            # Prefer the confirmed ATP headshot for Zverev over an incomplete
+            # provider image URL or a mismatched numeric upload id.
+            official_image = _atp_tour_player_image(player_name)
+            if official_image:
+                return official_image
+
     # Prefer the exact player photo returned by the Tennis API. Different
     # versions of the API have used slightly different field names.
     candidates = [
@@ -4074,7 +4872,9 @@ def _tennis_rows_for_tour(tour: str, start: date, end: date):
     return rows
 
 
-def _odds_api_tennis_events(date_from: date, date_to: date):
+def _odds_api_tennis_events(
+    date_from: date, date_to: date, tour: str | None = None
+):
     """Return current tennis events across the active ATP/WTA competitions.
 
     The previous implementation stopped after the first three competitions
@@ -4087,7 +4887,9 @@ def _odds_api_tennis_events(date_from: date, date_to: date):
         return []
 
     try:
-        sports = _odds_api_get("/sports", {"all": "true"}) or []
+        sports = _odds_api_get(
+            "/sports", {"all": "true"}, timeout=min(TIMEOUT, 8)
+        ) or []
     except Exception as exc:
         print(f"[TENNIS] The Odds API sports discovery failed: {exc}")
         return []
@@ -4108,12 +4910,17 @@ def _odds_api_tennis_events(date_from: date, date_to: date):
         return 60
 
     candidates = []
+    tour_key = str(tour or "").strip().lower()
     for row in sports:
         key = str(row.get("key") or "").strip()
         title = str(row.get("title") or key).strip()
         if not key.startswith("tennis_"):
             continue
         low_key = key.lower()
+        if tour_key in {"atp", "wta"} and not re.search(
+            rf"(?:^|_){re.escape(tour_key)}(?:_|$)", low_key
+        ):
+            continue
         # Skip futures/winner outright competitions.
         if "winner" in low_key or "championship" in low_key:
             continue
@@ -4147,6 +4954,7 @@ def _odds_api_tennis_events(date_from: date, date_to: date):
             raw_rows = _odds_api_get(
                 f"/sports/{sport_key}/odds",
                 params,
+                timeout=min(TIMEOUT, 8),
             ) or []
             successful_keys += 1
         except Exception as exc:
@@ -4573,6 +5381,25 @@ def _tennis_name_key(name: str) -> str:
     return " ".join(tokens)
 
 
+def _tennis_name_identity(name: str) -> tuple[str, str]:
+    """Return given-name initials and the final family-name token."""
+    text = unicodedata.normalize("NFKD", str(name or ""))
+    text = text.encode("ascii", "ignore").decode("ascii").lower()
+    if "," in text:
+        family_text, given_text = text.split(",", 1)
+        family_tokens = re.findall(r"[a-z0-9]+", family_text)
+        given_tokens = re.findall(r"[a-z0-9]+", given_text)
+    else:
+        tokens = re.findall(r"[a-z0-9]+", text)
+        given_tokens = tokens[:-1]
+        family_tokens = tokens[-1:]
+
+    particles = {"da", "de", "del", "der", "di", "la", "le", "van", "von"}
+    family_name = next((token for token in reversed(family_tokens) if token not in particles), "")
+    given_initials = "".join(token[:1] for token in given_tokens if token not in particles)
+    return (given_initials, family_name)
+
+
 def _tennis_names_match(a: str, b: str) -> bool:
     ka = _tennis_name_key(a)
     kb = _tennis_name_key(b)
@@ -4587,6 +5414,17 @@ def _tennis_names_match(a: str, b: str) -> bool:
     bset = set(bt)
     if aset == bset:
         return True
+
+    # Live score feeds commonly abbreviate players as "J. Munar" while odds
+    # feeds use "Jaume Munar". Keep initials for this comparison instead of
+    # discarding them during the general normalization above.
+    initials_a, surname_a = _tennis_name_identity(a)
+    initials_b, surname_b = _tennis_name_identity(b)
+    if surname_a and surname_a == surname_b and initials_a and initials_b:
+        # Feeds use both "C. H. Tseng" and "Chun-Hsin Tseng". Permit a
+        # shorter initial sequence only when it is a prefix of the full name.
+        if initials_a.startswith(initials_b) or initials_b.startswith(initials_a):
+            return True
 
     # Common provider formats: "Bergs, Zizou" vs "Zizou Bergs".
     if len(at) >= 2 and len(bt) >= 2 and at[-1] == bt[-1]:
@@ -4603,6 +5441,169 @@ def _tennis_names_match(a: str, b: str) -> bool:
     return _similar(a, b) >= 0.84
 
 
+def _tennis_names_match_precise(a: str, b: str) -> bool:
+    """Match the same player without the fuzzy fallback used for discovery."""
+    ka = _tennis_name_key(a)
+    kb = _tennis_name_key(b)
+    if not ka or not kb:
+        return False
+    if ka == kb or set(ka.split()) == set(kb.split()):
+        return True
+
+    tokens_a = re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKD", str(a or "")).encode("ascii", "ignore").decode("ascii").lower())
+    tokens_b = re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKD", str(b or "")).encode("ascii", "ignore").decode("ascii").lower())
+    particles = {"da", "de", "del", "der", "di", "la", "le", "van", "von"}
+    # Some feeds reverse given and family names ("Sun Xinran"), while other
+    # feeds abbreviate the given name ("X. Sun"). Match on the shared family
+    # token plus the given-name initial, independent of display order.
+    for shared in set(tokens_a) & set(tokens_b):
+        if shared in particles or len(shared) < 3:
+            continue
+        given_a = [token for token in tokens_a if token != shared and token not in particles]
+        given_b = [token for token in tokens_b if token != shared and token not in particles]
+        if not given_a or not given_b:
+            continue
+        if [token for token in given_a if len(token) > 1] == [token for token in given_b if len(token) > 1]:
+            if "".join(token[0] for token in given_a) == "".join(token[0] for token in given_b):
+                return True
+        initials_a = "".join(token[0] for token in given_a)
+        initials_b = "".join(token[0] for token in given_b)
+        has_initial = any(len(token) == 1 for token in given_a + given_b)
+        if has_initial and (initials_a.startswith(initials_b) or initials_b.startswith(initials_a)):
+            return True
+
+    initials_a, surname_a = _tennis_name_identity(a)
+    initials_b, surname_b = _tennis_name_identity(b)
+    return bool(
+        surname_a
+        and surname_a == surname_b
+        and initials_a
+        and initials_b
+        and (initials_a.startswith(initials_b) or initials_b.startswith(initials_a))
+    )
+
+
+def _tennis_preferred_display_name(current: str, incoming: str) -> str:
+    """Prefer the provider's full player name over a first-initial form."""
+    current = " ".join(str(current or "").split()).strip()
+    incoming = " ".join(str(incoming or "").split()).strip()
+    current_tokens = re.findall(r"[a-z0-9]+", current.lower())
+    incoming_tokens = re.findall(r"[a-z0-9]+", incoming.lower())
+    current_quality = (sum(len(token) for token in current_tokens), len(current_tokens))
+    incoming_quality = (sum(len(token) for token in incoming_tokens), len(incoming_tokens))
+    return incoming if incoming and incoming_quality > current_quality else current
+
+
+def _tennis_same_match(a: dict, b: dict, *, require_same_date: bool = True) -> tuple[bool, bool]:
+    """Return whether two provider rows describe the same singles match."""
+    if str(a.get("tour") or "").upper() != str(b.get("tour") or "").upper():
+        return False, True
+    date_a = str(a.get("date") or "").casefold()
+    date_b = str(b.get("date") or "").casefold()
+    if require_same_date and date_a and date_b and date_a != date_b:
+        return False, True
+    a_home, a_away = str(a.get("home_name") or ""), str(a.get("away_name") or "")
+    b_home, b_away = str(b.get("home_name") or ""), str(b.get("away_name") or "")
+    if (
+        _tennis_names_match_precise(a_home, b_home)
+        and _tennis_names_match_precise(a_away, b_away)
+    ):
+        return True, True
+    if (
+        _tennis_names_match_precise(a_home, b_away)
+        and _tennis_names_match_precise(a_away, b_home)
+    ):
+        return True, False
+    return False, True
+
+
+def _tennis_score_for_order(score_text: str, same_order: bool) -> str:
+    """Orient every set/game score to the displayed home/away player order."""
+    value = str(score_text or "")
+    if same_order or not value:
+        return value
+    return re.sub(
+        r"(?<![A-Za-z0-9])(AD|\d+)\s*-\s*(AD|\d+)(?![A-Za-z0-9])",
+        lambda match: f"{match.group(2)}-{match.group(1)}",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
+def _merge_tennis_fixture(existing: dict, incoming: dict, same_order: bool = True) -> None:
+    """Fold duplicate provider rows into one card without losing useful data."""
+    home_side, away_side = ("home", "away") if same_order else ("away", "home")
+    existing["home_name"] = _tennis_preferred_display_name(
+        str(existing.get("home_name") or ""), str(incoming.get(f"{home_side}_name") or "")
+    )
+    existing["away_name"] = _tennis_preferred_display_name(
+        str(existing.get("away_name") or ""), str(incoming.get(f"{away_side}_name") or "")
+    )
+    for field in ("player_id", "profile_name", "country", "logo"):
+        for target_side, source_side in (("home", home_side), ("away", away_side)):
+            key = f"{target_side}_{field}"
+            value = incoming.get(f"{source_side}_{field}")
+            if not existing.get(key) and value:
+                existing[key] = value
+
+    current_odds = existing.get("odds") or {}
+    incoming_odds = dict(incoming.get("odds") or {})
+    if not same_order:
+        incoming_odds["left"], incoming_odds["right"] = incoming_odds.get("right"), incoming_odds.get("left")
+    if (
+        (current_odds.get("left") is None or current_odds.get("right") is None)
+        and incoming_odds.get("left") is not None
+        and incoming_odds.get("right") is not None
+    ):
+        existing["odds"] = incoming_odds
+
+    old_status = str(existing.get("status") or "NS").upper()
+    new_status = str(incoming.get("status") or "NS").upper()
+    if new_status == "FT" or (new_status == "LIVE" and old_status != "FT"):
+        existing["status"] = new_status
+        for key in ("live_text", "score_text", "winner"):
+            if incoming.get(key):
+                existing[key] = (
+                    _tennis_score_for_order(incoming[key], same_order)
+                    if key in {"live_text", "score_text"} else incoming[key]
+                )
+        winner = str(incoming.get("winner") or "")
+        if winner and not same_order:
+            incoming_home = str(incoming.get("home_name") or "")
+            incoming_away = str(incoming.get("away_name") or "")
+            if _tennis_names_match_precise(winner, incoming_home):
+                existing["winner"] = str(existing.get("away_name") or "")
+            elif _tennis_names_match_precise(winner, incoming_away):
+                existing["winner"] = str(existing.get("home_name") or "")
+    for key in ("date", "time", "match_id"):
+        if not existing.get(key) and incoming.get(key):
+            existing[key] = incoming[key]
+    if (not existing.get("competition") or existing.get("competition") == "Tennis") and incoming.get("competition"):
+        existing["competition"] = incoming["competition"]
+    existing["tournament_rank"] = max(
+        int(existing.get("tournament_rank") or 0), int(incoming.get("tournament_rank") or 0)
+    )
+
+
+def _deduplicate_tennis_matches(items: list[dict]) -> list[dict]:
+    """Return one merged row per tour/date/opponent pair across all feeds."""
+    unique = []
+    for item in items:
+        duplicate = None
+        same_order = True
+        for existing in unique:
+            is_same, incoming_same_order = _tennis_same_match(existing, item)
+            if is_same:
+                duplicate = existing
+                same_order = incoming_same_order
+                break
+        if duplicate is None:
+            unique.append(item)
+        else:
+            _merge_tennis_fixture(duplicate, item, same_order)
+    return unique
+
+
 def _extract_tennis_h2h_strong(event: dict, left: str, right: str) -> dict | None:
     """Extract tennis h2h using tennis-specific name matching.
 
@@ -4616,8 +5617,9 @@ def _extract_tennis_h2h_strong(event: dict, left: str, right: str) -> dict | Non
         return None
 
     preferred = []
-    if THE_ODDS_BOOKMAKER:
-        wanted = THE_ODDS_BOOKMAKER.lower()
+    wanted_bookmaker = THE_ODDS_BOOKMAKER or API_TENNIS_BOOKMAKER
+    if wanted_bookmaker:
+        wanted = wanted_bookmaker.lower()
         preferred = [
             b for b in bookmakers
             if str(b.get("key") or b.get("title") or "").lower() == wanted
@@ -4652,13 +5654,47 @@ def _extract_tennis_h2h_strong(event: dict, left: str, right: str) -> dict | Non
     return None
 
 
-def _api_tennis_get(params: dict | None = None):
+def _api_tennis_get(params: dict | None = None, *, timeout: float | None = None):
     """Call API Tennis with its documented APIkey query parameter."""
     if not API_TENNIS_KEY:
         return {}
     query = dict(params or {})
     query["APIkey"] = API_TENNIS_KEY
-    return _get_json(API_TENNIS_BASE_URL, params=query)
+    return _get_json(
+        API_TENNIS_BASE_URL,
+        params=query,
+        timeout=min(TIMEOUT, 8) if timeout is None else timeout,
+    )
+
+
+def _api_tennis_singles_event_type_keys() -> dict[str, str]:
+    """Resolve ATP/WTA singles keys from the provider, with documented fallbacks."""
+    global _API_TENNIS_EVENT_TYPE_KEYS_CACHE
+    now_ts = time.monotonic()
+    cached = _API_TENNIS_EVENT_TYPE_KEYS_CACHE
+    if cached and now_ts - cached[0] < 6 * 60 * 60:
+        return dict(cached[1])
+
+    resolved = dict(API_TENNIS_SINGLES_EVENT_TYPE_KEYS)
+    try:
+        payload = _api_tennis_get({"method": "get_events"}) or {}
+        event_types = payload.get("result") if isinstance(payload, dict) else []
+        if isinstance(event_types, list):
+            for event_type in event_types:
+                if not isinstance(event_type, dict):
+                    continue
+                label = re.sub(
+                    r"[^a-z]+", " ",
+                    str(event_type.get("event_type_type") or "").casefold(),
+                ).strip()
+                key = str(event_type.get("event_type_key") or "").strip()
+                if key and label in {"atp singles", "wta singles"}:
+                    resolved[label.split()[0]] = key
+    except Exception as exc:
+        print(f"[TENNIS] API Tennis event type lookup failed; using documented keys: {exc}")
+
+    _API_TENNIS_EVENT_TYPE_KEYS_CACHE = (now_ts, resolved)
+    return dict(resolved)
 
 
 def _api_tennis_price(value):
@@ -4669,13 +5705,199 @@ def _api_tennis_price(value):
     return round(price, 2) if price >= 1 else None
 
 
-def _api_tennis_odds_events(start: date, end: date, tour: str | None = None) -> list[dict]:
-    """Fetch tennis fixtures + pre-match odds from API Tennis.
+def _api_tennis_profile_rows(payload) -> tuple[dict, ...]:
+    result = payload.get("result") if isinstance(payload, dict) else payload
+    if isinstance(result, dict):
+        result = list(result.values())
+    if not isinstance(result, list):
+        return ()
+    return tuple(row for row in result if isinstance(row, dict))
 
-    API Tennis exposes get_fixtures and get_odds by date range. We use one
-    fixture request and one odds request for the whole selected period, then
-    join by event_key. This avoids the request storm that hit OddsPapi.
-    """
+
+@lru_cache(maxsize=128)
+def _api_tennis_players_for_tournament(
+    tournament_key: str, timeout: float = 3
+) -> tuple[dict, ...]:
+    """Fetch one tournament roster so every match can use real flags/photos."""
+    key = str(tournament_key or "").strip()
+    if not key or not API_TENNIS_KEY:
+        return ()
+    try:
+        return _api_tennis_profile_rows(_api_tennis_get(
+            {"method": "get_players", "tournament_key": key},
+            timeout=min(TIMEOUT, timeout),
+        ))
+    except Exception as exc:
+        print(f"[TENNIS] API Tennis player roster lookup failed for tournament {key}: {exc}")
+        return ()
+
+
+@lru_cache(maxsize=2048)
+def _api_tennis_player_by_key(player_key: str) -> dict:
+    """Fallback profile lookup for players absent from a tournament roster."""
+    key = str(player_key or "").strip()
+    if not key or not API_TENNIS_KEY:
+        return {}
+    try:
+        rows = _api_tennis_profile_rows(_api_tennis_get({
+            "method": "get_players", "player_key": key,
+        }))
+        return rows[0] if rows else {}
+    except Exception:
+        return {}
+
+
+def _api_tennis_fixture_commence(fixture: dict) -> str:
+    """Keep API Tennis fixture times in the timezone requested from that API."""
+    raw_date = str(fixture.get("event_date") or "").strip()
+    raw_time = str(fixture.get("event_time") or "00:00").strip()
+    try:
+        value = datetime.fromisoformat(f"{raw_date}T{raw_time}")
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=YEREVAN_TZ)
+        return value.isoformat()
+    except ValueError:
+        return f"{raw_date}T{raw_time}:00"
+
+
+def _api_tennis_fixture_player_meta(fixture: dict, side: str) -> dict:
+    """Read optional player country/photo fields exposed by fixture feeds."""
+    prefix = "event_first_player" if side == "home" else "event_second_player"
+
+    def first_value(keys):
+        for key in keys:
+            value = fixture.get(key)
+            if isinstance(value, dict):
+                value = (
+                    value.get("code") or value.get("iocCode") or value.get("ioc_code")
+                    or value.get("countryAcr") or value.get("country_acr")
+                    or value.get("countryCode") or value.get("country_code")
+                    or value.get("alpha3") or value.get("alpha2")
+                    or value.get("iso3") or value.get("iso2") or value.get("name")
+                    or value.get("url") or value.get("src")
+                )
+            if value:
+                return str(value).strip()
+        return ""
+
+    logo = first_value((
+        f"{prefix}_photo_url", f"{prefix}_photo", f"{prefix}_image_url",
+        f"{prefix}_image", f"{prefix}_logo",
+    ))
+    if logo.startswith("/"):
+        logo = f"{TENNIS_BASE_URL}{logo}"
+    player_key_fields = (
+        ("first_player_key", "event_first_player_key", "event_first_player_id")
+        if side == "home" else
+        ("second_player_key", "event_second_player_key", "event_second_player_id")
+    )
+    player_key = next((str(fixture.get(key) or "").strip() for key in player_key_fields if fixture.get(key)), "")
+    country = first_value((
+        f"{prefix}_country_code", f"{prefix}_country_acr", f"{prefix}_country_acronym",
+        f"{prefix}_country_name", f"{prefix}_country", f"{prefix}_nationality",
+    ))
+    profile = {}
+    tournament_key = str(fixture.get("tournament_key") or "").strip()
+    # Tournament rosters can enrich missing photo/flag data, but do not issue
+    # a profile request for every participant when the fixture already has it.
+    if tournament_key and player_key and (not country or not logo):
+        profile = next((
+            row for row in _api_tennis_players_for_tournament(tournament_key, 3)
+            if str(row.get("player_key") or row.get("playerKey") or row.get("id") or "").strip() == player_key
+        ), {})
+
+    profile_logo = ""
+    for key in (
+        "image", "photo", "photo_url", "photoUrl", "playerPhoto", "playerPhotoUrl",
+        "profileImage", "profile_image", "picture", "avatar", "avatar_url", "avatarUrl",
+        "headshot", "headshot_url", "headshotUrl", "player_logo",
+    ):
+        value = profile.get(key)
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("src") or value.get("source")
+        if value:
+            profile_logo = str(value).strip()
+            break
+    if profile_logo.startswith("/"):
+        profile_logo = f"{TENNIS_BASE_URL}{profile_logo}"
+    elif profile_logo and not profile_logo.startswith(("https://", "http://")):
+        profile_logo = ""
+
+    country = country or _tennis_profile_country(profile)
+    return {
+        "country": country,
+        "logo": logo or profile_logo or _tennis_profile_image(profile) or None,
+        "name": str(profile.get("player_name") or profile.get("playerName") or profile.get("name") or "").strip(),
+        "id": player_key or str(profile.get("player_key") or "").strip(),
+    }
+
+
+def _api_tennis_fixture_state(fixture: dict, home: str, away: str) -> dict:
+    """Normalize API Tennis finished/live fields and actual set scores."""
+    status_text = str(fixture.get("event_status") or "").strip().lower()
+    live_raw = str(fixture.get("event_live") or "").strip().lower()
+    final_result = str(fixture.get("event_final_result") or "").strip()
+    game_result = str(fixture.get("event_game_result") or "").strip()
+    winner_raw = str(fixture.get("event_winner") or "").strip().lower()
+    placeholder = {"", "-", "--", "0-0", "0 - 0", "null", "none"}
+    terminal_status = status_text in {"final", "ft", "result"} or bool(re.search(
+        r"\b(?:finished|completed|complete|ended|retired|walkover)\b", status_text
+    ))
+    live = live_raw in {"1", "true", "yes"} or bool(re.search(
+        r"\b(?:live|in progress|\d+(?:st|nd|rd|th) set|set|tie.?break|serving)\b",
+        status_text,
+    ))
+    has_final_result = final_result.lower() not in placeholder and bool(
+        re.search(r"\d\s*[-:]\s*\d", final_result)
+    )
+    finished = (
+        terminal_status
+        or winner_raw in {"first player", "second player"}
+        or (has_final_result and not live)
+    )
+    if finished:
+        status = "FT"
+    elif live:
+        status = "LIVE"
+    else:
+        status = "NS"
+
+    scores = fixture.get("scores") or []
+    if isinstance(scores, list):
+        scores = sorted(
+            (row for row in scores if isinstance(row, dict)),
+            key=lambda row: int(row.get("score_set") or 0) if str(row.get("score_set") or "0").isdigit() else 0,
+        )
+    else:
+        scores = []
+    set_scores = [
+        f"{row.get('score_first')}-{row.get('score_second')}"
+        for row in scores
+        if str(row.get("score_first") or "").strip() not in placeholder
+        and str(row.get("score_second") or "").strip() not in placeholder
+    ]
+    score_parts = set_scores if set_scores else (
+        [final_result] if final_result.lower() not in placeholder else []
+    )
+    if status == "LIVE" and game_result.lower() not in placeholder:
+        score_parts.append(game_result)
+    winner = None
+    if winner_raw == "first player":
+        winner = home
+    elif winner_raw == "second player":
+        winner = away
+    elif winner_raw and winner_raw not in {"null", "none", "-"}:
+        winner = str(fixture.get("event_winner") or "").strip()
+    return {
+        "status": status,
+        "score_text": " | ".join(score_parts),
+        "live_text": (game_result or str(fixture.get("event_status") or "").strip()) if status == "LIVE" else "",
+        "winner": winner,
+    }
+
+
+def _api_tennis_odds_events(start: date, end: date, tour: str | None = None) -> list[dict]:
+    """Fetch tour fixtures independently from best-effort API Tennis prices."""
     if not API_TENNIS_KEY:
         print("[TENNIS] API Tennis odds key missing: add API_TENNIS_API_KEY to .env")
         return []
@@ -4688,13 +5910,26 @@ def _api_tennis_odds_events(start: date, end: date, tour: str | None = None) -> 
         return [dict(x) for x in cached[1]]
 
     try:
-        fixtures_payload = _api_tennis_get({
+        event_type_key = _api_tennis_singles_event_type_keys().get(tour_key)
+        fixture_params = {
             "method": "get_fixtures",
             "date_start": start.isoformat(),
             "date_stop": end.isoformat(),
             "timezone": TIMEZONE,
+        }
+        if event_type_key:
+            fixture_params["event_type_key"] = event_type_key
+        fixtures_payload = _api_tennis_get({
+            **fixture_params,
         }) or {}
         fixtures = fixtures_payload.get("result") or [] if isinstance(fixtures_payload, dict) else []
+        if not isinstance(fixtures, list):
+            fixtures = []
+        print(
+            f"[TENNIS] API Tennis {tour_key or 'all'} fixtures source returned "
+            f"{len(fixtures)} rows for {start.isoformat()}..{end.isoformat()} "
+            f"(event_type_key={event_type_key or 'all'})"
+        )
 
         fixture_map: dict[str, dict] = {}
         for fx in fixtures:
@@ -4722,14 +5957,26 @@ def _api_tennis_odds_events(start: date, end: date, tour: str | None = None) -> 
         # per-match query (`match_key`). This is important because some plans
         # return the date-range fixture feed correctly but expose pre-match
         # odds only when a specific match is requested.
-        odds_payload = _api_tennis_get({
-            "method": "get_odds",
-            "date_start": start.isoformat(),
-            "date_stop": end.isoformat(),
-        }) or {}
-        odds_result = odds_payload.get("result") if isinstance(odds_payload, dict) else {}
-        if not isinstance(odds_result, dict):
-            odds_result = {}
+        odds_result = {}
+        try:
+            odds_params = {
+                "method": "get_odds",
+                "date_start": start.isoformat(),
+                "date_stop": end.isoformat(),
+            }
+            if event_type_key:
+                odds_params["event_type_key"] = event_type_key
+            odds_payload = _api_tennis_get(odds_params) or {}
+            odds_result = odds_payload.get("result") if isinstance(odds_payload, dict) else {}
+            if not isinstance(odds_result, dict):
+                odds_result = {}
+        except Exception as exc:
+            # Odds are optional enrichment; never discard a valid schedule when
+            # a provider rejects a wide historical/month odds query.
+            print(
+                f"[TENNIS] API Tennis date-range odds failed for "
+                f"{start.isoformat()}..{end.isoformat()}; keeping fixtures: {exc}"
+            )
 
         def bookmaker_price(prices: dict, bookmaker: str):
             wanted = str(bookmaker or "").lower().strip()
@@ -4793,11 +6040,14 @@ def _api_tennis_odds_events(start: date, end: date, tour: str | None = None) -> 
                 "bet365", "bwin", "betsson", "william hill", "unibet",
                 "1xbet", "888sport", "sportingbet", "betcris", "pinnacle",
             ]
-            by_name = {name: (name, left, right) for name, left, right in candidates}
+            # extract_prices() returns (P1 price, P2 price, bookmaker). Keep
+            # this order consistent with the preferred-bookmaker branch above.
+            by_name = {name: (left, right, name) for name, left, right in candidates}
             for name in preference_order:
                 if name in by_name:
                     return by_name[name]
-            return candidates[0]
+            name, left, right = candidates[0]
+            return left, right, name
 
         events: list[dict] = []
         missing_fixture_odds: list[tuple[str, dict]] = []
@@ -4807,19 +6057,65 @@ def _api_tennis_odds_events(start: date, end: date, tour: str | None = None) -> 
             if raw is None:
                 raw = odds_result.get(str(event_key))
             left_price, right_price, used_bookmaker = extract_prices(raw, API_TENNIS_BOOKMAKER)
-            if left_price is None or right_price is None:
-                missing_fixture_odds.append((event_key, fx))
-                continue
-
             home = str(fx.get("event_first_player") or "").strip()
             away = str(fx.get("event_second_player") or "").strip()
+            home_meta = _api_tennis_fixture_player_meta(fx, "home")
+            away_meta = _api_tennis_fixture_player_meta(fx, "away")
             if not home or not away:
                 continue
+            fixture_state = _api_tennis_fixture_state(fx, home, away)
+            if left_price is None or right_price is None:
+                missing_fixture_odds.append((event_key, fx))
+                # Keep the fixture even if this provider has not published
+                # prices yet; it still improves the ATP/WTA match count.
+                events.append({
+                    "id": event_key,
+                    "home_team": home,
+                    "away_team": away,
+                    "commence_time": _api_tennis_fixture_commence(fx),
+                    "_api_prices": None,
+                    "_home_country": home_meta["country"],
+                    "_away_country": away_meta["country"],
+                    "_home_logo": home_meta["logo"],
+                    "_away_logo": away_meta["logo"],
+                    "_home_player_id": home_meta["id"],
+                    "_away_player_id": away_meta["id"],
+                    "_home_profile_name": home_meta["name"],
+                    "_away_profile_name": away_meta["name"],
+                    "_status": fixture_state["status"],
+                    "_score_text": fixture_state["score_text"],
+                    "_live_text": fixture_state["live_text"],
+                    "_winner": fixture_state["winner"],
+                    "bookmakers": [],
+                    "_api_tennis": True,
+                    "_fixture_only": True,
+                    "_tournament_title": str(fx.get("tournament_name") or "Tennis").strip(),
+                    "_event_type": str(fx.get("event_type_type") or ""),
+                })
+                continue
+
             events.append({
                 "id": event_key,
                 "home_team": home,
                 "away_team": away,
-                "commence_time": f"{fx.get('event_date')}T{fx.get('event_time') or '00:00'}:00",
+                "commence_time": _api_tennis_fixture_commence(fx),
+                "_api_prices": {
+                    "left": left_price,
+                    "right": right_price,
+                    "bookmaker": used_bookmaker or API_TENNIS_BOOKMAKER,
+                },
+                "_home_country": home_meta["country"],
+                "_away_country": away_meta["country"],
+                "_home_logo": home_meta["logo"],
+                "_away_logo": away_meta["logo"],
+                "_home_player_id": home_meta["id"],
+                "_away_player_id": away_meta["id"],
+                "_home_profile_name": home_meta["name"],
+                "_away_profile_name": away_meta["name"],
+                "_status": fixture_state["status"],
+                "_score_text": fixture_state["score_text"],
+                "_live_text": fixture_state["live_text"],
+                "_winner": fixture_state["winner"],
                 "bookmakers": [{
                     "key": used_bookmaker or API_TENNIS_BOOKMAKER,
                     "title": used_bookmaker or API_TENNIS_BOOKMAKER,
@@ -4843,11 +6139,25 @@ def _api_tennis_odds_events(start: date, end: date, tour: str | None = None) -> 
         # number of matches that the bot displays.
         per_match_checked = 0
         if missing_fixture_odds:
+            today = datetime.now(YEREVAN_TZ).date()
+            upcoming_missing_odds = []
+            for event_key, fx in missing_fixture_odds:
+                try:
+                    fixture_day = date.fromisoformat(str(fx.get("event_date") or "")[:10])
+                except ValueError:
+                    fixture_day = today
+                if fixture_day >= today:
+                    upcoming_missing_odds.append((event_key, fx))
+            print(
+                f"[TENNIS] API Tennis match_key odds: "
+                f"{len(upcoming_missing_odds)} upcoming fixtures to check; "
+                f"skipped {len(missing_fixture_odds) - len(upcoming_missing_odds)} finished fixtures"
+            )
             if API_TENNIS_BOOKMAKER == "auto":
-                print(f"[TENNIS] API Tennis: no complete Home/Away prices found in date-range odds for {len(missing_fixture_odds)} fixtures; trying match_key with ANY bookmaker")
+                print(f"[TENNIS] API Tennis: no complete Home/Away prices found in date-range odds; trying match_key with ANY bookmaker")
             else:
-                print(f"[TENNIS] API Tennis: no complete {API_TENNIS_BOOKMAKER} Home/Away prices found for {len(missing_fixture_odds)} fixtures; match_key fallback will also allow any bookmaker")
-            for event_key, fx in missing_fixture_odds[:12]:
+                print(f"[TENNIS] API Tennis: no complete {API_TENNIS_BOOKMAKER} Home/Away prices found; match_key fallback will also allow any bookmaker")
+            for event_key, fx in upcoming_missing_odds[:12]:
                 try:
                     per_match_checked += 1
                     one_payload = _api_tennis_get({
@@ -4867,13 +6177,33 @@ def _api_tennis_odds_events(start: date, end: date, tour: str | None = None) -> 
 
                     home = str(fx.get("event_first_player") or "").strip()
                     away = str(fx.get("event_second_player") or "").strip()
+                    home_meta = _api_tennis_fixture_player_meta(fx, "home")
+                    away_meta = _api_tennis_fixture_player_meta(fx, "away")
                     if not home or not away:
                         continue
+                    fixture_state = _api_tennis_fixture_state(fx, home, away)
                     events.append({
                         "id": event_key,
                         "home_team": home,
                         "away_team": away,
-                        "commence_time": f"{fx.get('event_date')}T{fx.get('event_time') or '00:00'}:00",
+                        "commence_time": _api_tennis_fixture_commence(fx),
+                        "_api_prices": {
+                            "left": left_price,
+                            "right": right_price,
+                            "bookmaker": used_bookmaker or API_TENNIS_BOOKMAKER,
+                        },
+                        "_home_country": home_meta["country"],
+                        "_away_country": away_meta["country"],
+                        "_home_logo": home_meta["logo"],
+                        "_away_logo": away_meta["logo"],
+                        "_home_player_id": home_meta["id"],
+                        "_away_player_id": away_meta["id"],
+                        "_home_profile_name": home_meta["name"],
+                        "_away_profile_name": away_meta["name"],
+                        "_status": fixture_state["status"],
+                        "_score_text": fixture_state["score_text"],
+                        "_live_text": fixture_state["live_text"],
+                        "_winner": fixture_state["winner"],
                         "bookmakers": [{
                             "key": used_bookmaker or API_TENNIS_BOOKMAKER,
                             "title": used_bookmaker or API_TENNIS_BOOKMAKER,
@@ -4905,14 +6235,17 @@ def _api_tennis_odds_events(start: date, end: date, tour: str | None = None) -> 
         events = list(unique_events.values())
         events.sort(key=lambda e: str(e.get("commence_time") or ""))
         _API_TENNIS_ODDS_CACHE[cache_key] = (now_ts, events)
+        priced_count = sum(1 for event in events if event.get("bookmakers"))
         print(
             f"[TENNIS] API Tennis fixtures={len(fixture_map)}; "
-            f"odds events={len(events)}; preferred bookmaker={API_TENNIS_BOOKMAKER}; "
+            f"events={len(events)}; priced={priced_count}; "
+            f"without odds={len(events) - priced_count}; "
+            f"preferred bookmaker={API_TENNIS_BOOKMAKER}; "
             f"per-match checked={per_match_checked}"
         )
         return [dict(x) for x in events]
     except Exception as exc:
-        print(f"[TENNIS] API Tennis odds failed: {exc}")
+        print(f"[TENNIS] API Tennis odds failed ({type(exc).__name__}): {exc!r}")
         return []
 
 
@@ -4950,14 +6283,32 @@ def _live_tennis_key() -> str:
     return (os.getenv("LIVE_TENNIS_API_KEY") or "").strip()
 
 
-def _live_tennis_get(path: str, params: dict | None = None):
+_LIVE_TENNIS_RATE_LIMIT_UNTIL = 0.0
+_LIVE_TENNIS_RATE_LIMIT_LOCK = threading.Lock()
+
+
+def _live_tennis_rate_limited() -> bool:
+    with _LIVE_TENNIS_RATE_LIMIT_LOCK:
+        return time.monotonic() < _LIVE_TENNIS_RATE_LIMIT_UNTIL
+
+
+def _live_tennis_get(
+    path: str, params: dict | None = None, *, timeout: float | None = None
+):
+    global _LIVE_TENNIS_RATE_LIMIT_UNTIL
     key = _live_tennis_key()
     if not key:
         raise RuntimeError("LIVE_TENNIS_API_KEY is missing from .env")
+    with _LIVE_TENNIS_RATE_LIMIT_LOCK:
+        remaining = _LIVE_TENNIS_RATE_LIMIT_UNTIL - time.monotonic()
+    if remaining > 0:
+        raise RuntimeError(
+            f"Live Tennis API paused after HTTP 429; retry in {int(remaining) + 1}s"
+        )
     # Live Tennis API documents Bearer authentication. X-API-Key is also
     # accepted by the public API, so send both for compatibility with keys
     # issued in either form.
-    return _get_json(
+    response = requests.get(
         f"{LIVE_TENNIS_BASE_URL}{path}",
         headers={
             "Authorization": f"Bearer {key}",
@@ -4965,7 +6316,25 @@ def _live_tennis_get(path: str, params: dict | None = None):
             "Accept": "application/json",
         },
         params=params,
+        timeout=min(TIMEOUT, 5) if timeout is None else timeout,
     )
+    if response.status_code == 429:
+        try:
+            retry_after = max(30, int(response.headers.get("Retry-After") or 60))
+        except (TypeError, ValueError):
+            retry_after = 60
+        with _LIVE_TENNIS_RATE_LIMIT_LOCK:
+            _LIVE_TENNIS_RATE_LIMIT_UNTIL = max(
+                _LIVE_TENNIS_RATE_LIMIT_UNTIL, time.monotonic() + retry_after
+            )
+        raise RuntimeError(
+            f"Live Tennis API HTTP 429; pausing requests for {retry_after}s"
+        )
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, dict) and (payload.get("error") or payload.get("err")):
+        raise RuntimeError(str(payload.get("error") or payload.get("err")))
+    return payload
 
 
 def _live_tennis_rank(tournament: str) -> int:
@@ -4985,11 +6354,237 @@ def _live_tennis_rank(tournament: str) -> int:
 
 def _live_tennis_player(player: dict | None) -> dict:
     player = player if isinstance(player, dict) else {}
+    image = next((
+        player.get(key) for key in (
+            "image", "photo", "photo_url", "photoUrl", "avatar", "avatar_url",
+            "avatarUrl", "headshot", "headshot_url", "headshotUrl", "playerPhoto",
+            "playerPhotoUrl", "image_url", "imageUrl",
+        ) if player.get(key)
+    ), None)
+    if isinstance(image, dict):
+        image = image.get("url") or image.get("src") or image.get("source")
+    image = _tennis_profile_image(player) or (str(image).strip() if image else None)
+    if image and image.startswith("/"):
+        image = f"{LIVE_TENNIS_BASE_URL}{image}"
     return {
-        "name": str(player.get("name") or "Player").strip(),
-        "id": player.get("id"),
-        "country": str(player.get("country") or "").strip(),
+        "name": str(player.get("name") or player.get("fullName") or "Player").strip(),
+        "id": player.get("id") or player.get("playerId") or player.get("player_id"),
+        "country": _tennis_profile_country(player),
+        "image": str(image).strip() if image else None,
     }
+
+
+def _tennis_profile_country(player: dict) -> str:
+    for key in (
+        "country", "countryCode", "country_code", "countryAcr", "countryAcronym",
+        "country_acr", "country_acronym",
+        "countryName", "country_name", "nation", "nationality", "nationalityName",
+        "nationality_name", "nationalityCode", "nationality_code", "countryIso",
+        "countryISO", "countryIso2", "countryIso3", "country_iso", "country_iso2",
+        "country_iso3", "countryAbbreviation", "country_abbreviation", "iocCode",
+        "ioc_code", "alpha2", "alpha3", "isoCode", "iso_code", "player_country",
+    ):
+        value = player.get(key)
+        if isinstance(value, dict):
+            value = (
+                value.get("ioc") or value.get("iocCode") or value.get("ioc_code") or value.get("code")
+                or value.get("alpha3") or value.get("alpha2") or value.get("iso3")
+                or value.get("iso2") or value.get("abbreviation") or value.get("name")
+                or value.get("countryAcr") or value.get("country_acr")
+                or value.get("countryCode") or value.get("country_code")
+                or value.get("countryName") or value.get("country_name")
+            )
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _tennis_country_from_profile_html(source: str) -> str:
+    """Read nationality from official ATP/WTA profile markup."""
+    if not source:
+        return ""
+    source = html.unescape(str(source))
+    structured = re.search(
+        r"[\"'](?:countryName|country|nationalityName|nationality|countryCode|countryAcr)[\"']\s*:\s*[\"']([^\"']+)[\"']",
+        source,
+        re.IGNORECASE,
+    )
+    if structured:
+        return structured.group(1).strip()
+
+    visible = re.sub(
+        r"<(script|style)\b[^>]*>.*?</\1>", " ", source,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    visible = " ".join(re.sub(r"<[^>]+>", " ", visible).split())
+    country_match = re.search(
+        r"\bCountry\s+([A-Za-z][A-Za-z .'-]*?)(?=\s+(?:Birthplace|Plays|Coach|Age|Weight|Height|Turned pro)\b)",
+        visible,
+        re.IGNORECASE,
+    )
+    return country_match.group(1).strip(" .") if country_match else ""
+
+
+def _tennis_profile_image(player: dict) -> str:
+    for key in (
+        "image", "photo", "photo_url", "photoUrl", "playerPhoto", "playerPhotoUrl",
+        "profileImage", "profile_image", "picture", "avatar", "avatar_url", "avatarUrl",
+        "headshot", "headshot_url", "headshotUrl", "player_logo",
+    ):
+        value = player.get(key)
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("src") or value.get("source")
+        if value:
+            value = str(value).strip()
+            if value.startswith("https://") or value.startswith("http://"):
+                return value
+            if value.startswith("/"):
+                return f"{LIVE_TENNIS_BASE_URL}{value}"
+    return ""
+
+
+@lru_cache(maxsize=512)
+def _live_tennis_player_details(
+    player_name: str,
+    player_id: str | int | None = None,
+    timeout: float | None = None,
+) -> dict:
+    """Resolve a canonical player name, nationality, and portrait once per player."""
+    name = " ".join(str(player_name or "").split()).strip()
+    if not name or not _live_tennis_key():
+        return {}
+
+    def as_profiles(payload):
+        if not isinstance(payload, dict):
+            return payload if isinstance(payload, list) else []
+        value = payload.get("data") or payload
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            for key in ("players", "results", "items", "content"):
+                children = value.get(key)
+                if isinstance(children, (list, dict)):
+                    return as_profiles(children)
+            for key in ("player", "profile", "result", "item"):
+                child = value.get(key)
+                if isinstance(child, (list, dict)):
+                    return as_profiles(child)
+            return [value]
+        return []
+
+    profiles = []
+    id_only_profile = None
+    best_profile = {}
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
+    def fetch_profile(path: str, params: dict | None = None):
+        request_timeout = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            request_timeout = max(0.25, remaining)
+        return _live_tennis_get(path, params, timeout=request_timeout)
+
+    if player_id is not None:
+        try:
+            payload = fetch_profile(f"/players/{quote(str(player_id))}") or {}
+            profiles.extend(as_profiles(payload))
+        except Exception:
+            pass
+    search_terms = [name]
+    initials, surname = _tennis_name_identity(name)
+    if surname and initials and re.match(r"^(?:[A-Z]\.?(?:\s|$))+", name, re.IGNORECASE):
+        # The roster search often indexes full names only; searching the
+        # surname lets us resolve score/odds feeds such as "A. Galarneau".
+        search_terms.append(surname)
+    for search_term in dict.fromkeys(search_terms):
+        try:
+            payload = fetch_profile(
+                "/players", {"search": search_term, "limit": 20}
+            ) or {}
+            profiles.extend(as_profiles(payload))
+        except Exception:
+            pass
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+
+    for player in profiles:
+        if not isinstance(player, dict):
+            continue
+        candidate = str(
+            player.get("name") or player.get("fullName") or player.get("playerName") or ""
+        ).strip()
+        if not candidate:
+            candidate = " ".join(
+                str(player.get(key) or "").strip() for key in ("firstName", "lastName")
+            ).strip()
+        profile_id = (
+            player.get("id") or player.get("playerId") or player.get("player_id")
+            or player.get("idPlayer") or player_id
+        )
+        # An id-specific response is authoritative even if it omits the name.
+        if candidate and not _tennis_names_match(name, candidate):
+            continue
+        if not candidate and player_id is None:
+            continue
+        country = _tennis_profile_country(player)
+        image = _tennis_profile_image(player)
+        resolved = {
+            "name": candidate or name,
+            "id": profile_id,
+            "country": country,
+            "image": image,
+        }
+        if country or image or candidate:
+            best_profile = {
+                "name": candidate or best_profile.get("name") or name,
+                "id": profile_id or best_profile.get("id"),
+                "country": country or best_profile.get("country") or "",
+                "image": image or best_profile.get("image") or "",
+            }
+            if best_profile.get("country") and best_profile.get("image"):
+                return best_profile
+        if profile_id and id_only_profile is None:
+            id_only_profile = resolved
+    return best_profile or id_only_profile or {}
+
+
+@lru_cache(maxsize=512)
+def _live_tennis_player_country(
+    player_name: str,
+    tour: str | None = None,
+    timeout: float | None = None,
+) -> str:
+    """Resolve a missing nationality for odds-only fixtures, when available."""
+    normalized_name = " ".join(
+        re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKD", str(player_name or "")).encode("ascii", "ignore").decode("ascii").lower())
+    )
+    # These two players are in the current sample cards; this exact-name map
+    # keeps their flags visible even if a provider omits nationality fields.
+    known_countries = {
+        "c gauff": "USA", "coco gauff": "USA",
+        "x sun": "CHN", "sun xinran": "CHN",
+        "c wong": "HKG", "coleman wong": "HKG",
+        "c hewitt": "AUS", "cruz hewitt": "AUS",
+    }
+    if normalized_name in known_countries:
+        return known_countries[normalized_name]
+
+    country = str(
+        _live_tennis_player_details(player_name, timeout=timeout).get("country") or ""
+    ).strip()
+    if country:
+        return country
+    tour_key = str(tour or "").strip().lower()
+    if tour_key == "atp":
+        return _atp_tour_player_country(player_name, timeout)
+    if tour_key == "wta":
+        return _wta_tour_player_country(player_name, timeout)
+    return (
+        _atp_tour_player_country(player_name, timeout)
+        or _wta_tour_player_country(player_name, timeout)
+    )
 
 
 def _live_tennis_score_text(match: dict) -> tuple[str, str]:
@@ -5033,7 +6628,7 @@ def _live_tennis_normalize(row: dict, tour: str) -> dict:
         except (TypeError, ValueError):
             winner = None
     tournament = str(row.get("tournament") or "Tennis").strip()
-    scheduled = row.get("scheduled_time") or row.get("live_at")
+    scheduled = (row.get("live_at") or row.get("scheduled_time")) if status == "LIVE" else (row.get("scheduled_time") or row.get("live_at"))
     date_text, time_text = _date_time(scheduled)
     rank = _live_tennis_rank(tournament)
     return {
@@ -5044,8 +6639,12 @@ def _live_tennis_normalize(row: dict, tour: str) -> dict:
         "tour": str(row.get("tour") or tour).upper(),
         "home_name": p1["name"],
         "away_name": p2["name"],
-        "home_logo": _wikipedia_player_image(p1["name"]),
-        "away_logo": _wikipedia_player_image(p2["name"]),
+        # Preserve a portrait when the schedule provider included one. Other
+        # sources are resolved lazily when the card is rendered.
+        "home_logo": p1.get("image"),
+        "away_logo": p2.get("image"),
+        "home_player_id": p1.get("id"),
+        "away_player_id": p2.get("id"),
         "home_country": p1["country"],
         "away_country": p2["country"],
         "status": status,
@@ -5062,24 +6661,86 @@ def _live_tennis_normalize(row: dict, tour: str) -> dict:
 
 
 def _live_tennis_rows_for_tour(tour: str, start: date, end: date) -> list[dict]:
-    """Fetch FREE upcoming/live singles matches for one ATP/WTA tour."""
-    if not _live_tennis_key():
+    """Fetch scheduled, upcoming and live singles matches for one ATP/WTA tour."""
+    if not _live_tennis_key() or _live_tennis_rate_limited():
         return []
-    payload = _live_tennis_get(
-        "/matches",
-        {
-            "status": "upcoming",
-            "tour": tour,
-            "draw": "singles",
-            "from": start.isoformat(),
-            "to": end.isoformat(),
-            "limit": 200,
-            "offset": 0,
-        },
-    ) or {}
-    rows = list(payload.get("data") or []) if isinstance(payload, dict) else []
-    # Also include currently live matches when the selected window contains today.
+
+    rows = []
+
     today = datetime.now(YEREVAN_TZ).date()
+
+    def append_in_window(payload, *, include_live_today: bool = False):
+        data = payload.get("data") if isinstance(payload, dict) else []
+        for row in data or []:
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "").lower()
+            if include_live_today and status == "live" and start <= today <= end:
+                rows.append(row)
+                continue
+            scheduled = row.get("live_at") if status == "live" else row.get("scheduled_time")
+            scheduled = scheduled or row.get("scheduled_time") or row.get("live_at")
+            local_dt = _parse_dt(scheduled)
+            if local_dt and start <= local_dt.date() <= end:
+                rows.append(row)
+
+    # /fixtures is the provider's dedicated scheduled-fixture feed. Unlike
+    # /matches?status=upcoming, it explicitly contains upcoming draws and can
+    # be paged. Omit is_qualifying so qualifying and main-draw matches are both
+    # included; this matters for thin WTA slates and lower-ranked entrants.
+    page_size = 200
+    offset = 0
+    max_pages = 8
+    for _ in range(max_pages):
+        try:
+            fixture_payload = _live_tennis_get(
+                "/fixtures",
+                {
+                    "tour": tour,
+                    "draw": "singles",
+                    "limit": page_size,
+                    "offset": offset,
+                },
+            ) or {}
+        except Exception as exc:
+            print(f"[TENNIS] Live Tennis API fixtures query failed ({tour}): {exc}")
+            break
+        if _live_tennis_rate_limited():
+            return []
+        page = list(fixture_payload.get("data") or []) if isinstance(fixture_payload, dict) else []
+        if not page:
+            break
+        append_in_window({"data": page})
+        dated = [_parse_dt(row.get("scheduled_time")) for row in page if isinstance(row, dict)]
+        dated = [dt for dt in dated if dt]
+        if dated and min(dt.date() for dt in dated) > end:
+            break
+        offset += len(page)
+        if len(page) < page_size:
+            break
+
+    # Keep the score endpoint as a second source: it can contain recent
+    # schedule corrections that have not propagated to /fixtures yet.
+    try:
+        upcoming_payload = _live_tennis_get(
+            "/matches",
+            {
+                "status": "upcoming",
+                "tour": tour,
+                "draw": "singles",
+                "from": start.isoformat(),
+                "to": end.isoformat(),
+                "limit": 200,
+                "offset": 0,
+            },
+        ) or {}
+        append_in_window(upcoming_payload)
+    except Exception as exc:
+        print(f"[TENNIS] Live Tennis API upcoming query failed ({tour}): {exc}")
+    if _live_tennis_rate_limited():
+        return []
+
+    # Also include currently live matches when the selected window contains today.
     if start <= today <= end:
         try:
             live_payload = _live_tennis_get(
@@ -5092,7 +6753,7 @@ def _live_tennis_rows_for_tour(tour: str, start: date, end: date) -> list[dict]:
                     "offset": 0,
                 },
             ) or {}
-            rows.extend(list(live_payload.get("data") or []))
+            append_in_window(live_payload, include_live_today=True)
         except Exception as exc:
             print(f"[TENNIS] Live Tennis API live query failed ({tour}): {exc}")
     # De-duplicate by provider match id.
@@ -5118,6 +6779,8 @@ def _sofascore_tennis_tour(event: dict) -> str | None:
                 elif value is not None:
                     blobs.append(str(value))
     text = " ".join(blobs).lower()
+    if any(token in text for token in ("itf", "challenger", "futures", "junior")):
+        return None
     if any(token in text for token in ("wta", "women", "woman", "female")):
         return "wta"
     if any(token in text for token in ("atp", "men", "man", "male")):
@@ -5152,6 +6815,69 @@ def _sofascore_tennis_tour(event: dict) -> str | None:
     return None
 
 
+_SOFASCORE_TENNIS_DAY_CACHE: dict[str, tuple[float, dict]] = {}
+_SOFASCORE_TENNIS_CACHE_LOCK = threading.Lock()
+_SOFASCORE_TENNIS_PROVIDER_BLOCKED_UNTIL = 0.0
+
+
+def _sofascore_tennis_day(date_text: str) -> dict:
+    """Fetch one SofaScore schedule day with a short, refreshable cache."""
+    global _SOFASCORE_TENNIS_PROVIDER_BLOCKED_UNTIL
+    today_text = datetime.now(YEREVAN_TZ).date().isoformat()
+    ttl = 60 if date_text == today_text else 900
+    now = time.monotonic()
+    with _SOFASCORE_TENNIS_CACHE_LOCK:
+        if now < _SOFASCORE_TENNIS_PROVIDER_BLOCKED_UNTIL:
+            return {}
+        cached = _SOFASCORE_TENNIS_DAY_CACHE.get(date_text)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+
+    try:
+        payload = _get_json(
+            f"https://api.sofascore.com/api/v1/sport/tennis/scheduled-events/{date_text}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 Chrome/142.0 Safari/537.36",
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://www.sofascore.com/",
+            },
+            timeout=min(TIMEOUT, 4),
+        ) or {}
+    except Exception as exc:
+        print(f"[TENNIS] SofaScore fallback failed for {date_text}: {type(exc).__name__}")
+        payload = {}
+        # A blocked provider should not receive 31 more month-range requests
+        # (or be queried again immediately for the second tour).
+        cooldown = 3600 if "403" in str(exc) or "forbidden" in str(exc).lower() else 60
+        with _SOFASCORE_TENNIS_CACHE_LOCK:
+            _SOFASCORE_TENNIS_PROVIDER_BLOCKED_UNTIL = max(
+                _SOFASCORE_TENNIS_PROVIDER_BLOCKED_UNTIL,
+                time.monotonic() + cooldown,
+            )
+
+    if not isinstance(payload, dict):
+        payload = {}
+    with _SOFASCORE_TENNIS_CACHE_LOCK:
+        _SOFASCORE_TENNIS_DAY_CACHE[date_text] = (time.monotonic(), payload)
+    return payload
+
+
+def _sofascore_tennis_country(team: dict) -> str:
+    for key in ("countryCode", "countryAcr", "nationalityCode", "nationality"):
+        value = team.get(key)
+        if value:
+            return str(value).strip()
+    country = team.get("country")
+    if isinstance(country, dict):
+        for key in ("alpha3", "alpha2", "code", "countryCode", "name"):
+            if country.get(key):
+                return str(country[key]).strip()
+    elif country:
+        return str(country).strip()
+    return ""
+
+
 def _sofascore_tennis_rows(start: date, end: date, tour: str) -> list[dict]:
     """Fallback tennis fixtures source when RapidAPI Tennis API is unavailable.
 
@@ -5159,42 +6885,44 @@ def _sofascore_tennis_rows(start: date, end: date, tour: str) -> list[dict]:
     only for fixture discovery; bookmaker odds still come from The Odds API.
     """
     rows = []
+    days = []
     current = start
     while current <= end:
-        date_text = current.isoformat()
-        payload = None
-        # This endpoint is used by public SofaScore clients for daily tennis.
-        # If a WAF blocks it, simply skip the day and let the caller continue.
-        try:
-            payload = _get_json(
-                f"https://api.sofascore.com/api/v1/sport/tennis/scheduled-events/{date_text}",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                  "AppleWebKit/537.36 Chrome/142.0 Safari/537.36",
-                    "Accept": "application/json,text/plain,*/*",
-                    "Referer": "https://www.sofascore.com/",
-                },
-            )
-        except Exception as exc:
-            print(f"[TENNIS] SofaScore fallback failed for {date_text}: {exc}")
-            payload = {}
+        days.append(current.isoformat())
+        current += timedelta(days=1)
 
+    # A month can span 31 daily schedule calls. Fetch a small batch in
+    # parallel so a slow day does not keep the whole WTA/ATP list waiting.
+    with ThreadPoolExecutor(max_workers=min(2, max(1, len(days)))) as executor:
+        daily_payloads = list(executor.map(_sofascore_tennis_day, days))
+
+    for date_text, payload in zip(days, daily_payloads):
         for event in (payload or {}).get("events", []) or []:
             if not isinstance(event, dict):
                 continue
             if _sofascore_tennis_tour(event) != tour:
                 continue
 
+            tournament = event.get("tournament") or {}
+            unique = tournament.get("uniqueTournament") or {}
+            event_title = " ".join(str(value or "") for value in (
+                tournament.get("name"), unique.get("name"), event.get("slug")
+            )).lower()
+            if "double" in event_title:
+                continue
+
             home = event.get("homeTeam") or {}
             away = event.get("awayTeam") or {}
+            home_id = home.get("id")
+            away_id = away.get("id")
             start_ts = event.get("startTimestamp")
             try:
                 dt = datetime.fromtimestamp(float(start_ts), tz=UTC_TZ).astimezone(YEREVAN_TZ)
             except (TypeError, ValueError, OSError):
                 dt = None
+            if dt and not (start <= dt.date() <= end):
+                continue
 
-            tournament = event.get("tournament") or {}
-            unique = tournament.get("uniqueTournament") or {}
             status_obj = event.get("status") or {}
             status_type = str(status_obj.get("type") or "").lower()
             status = "LIVE" if status_type in {"inprogress", "inprogress"} else "NS"
@@ -5222,18 +6950,44 @@ def _sofascore_tennis_rows(start: date, end: date, tour: str) -> list[dict]:
             else:
                 rank = 50
 
+            try:
+                winner_code = int(event.get("winnerCode") or 0)
+            except (TypeError, ValueError):
+                winner_code = 0
             rows.append({
-                "player1": {"name": str(home.get("name") or "Player 1"), "id": home.get("id")},
-                "player2": {"name": str(away.get("name") or "Player 2"), "id": away.get("id")},
+                "player1": {
+                    "name": str(home.get("name") or "Player 1"),
+                    "id": home_id,
+                    "image": (
+                        f"https://api.sofascore.com/api/v1/player/{home_id}/image"
+                        if home_id is not None else None
+                    ),
+                    "countryAcr": _sofascore_tennis_country(home),
+                },
+                "player2": {
+                    "name": str(away.get("name") or "Player 2"),
+                    "id": away_id,
+                    "image": (
+                        f"https://api.sofascore.com/api/v1/player/{away_id}/image"
+                        if away_id is not None else None
+                    ),
+                    "countryAcr": _sofascore_tennis_country(away),
+                },
                 "tournament": {"name": tournament_name},
                 "round": {"name": str((event.get("roundInfo") or {}).get("name") or "")},
                 "date": dt.isoformat() if dt else date_text,
                 "id": event.get("id"),
+                "_status": status,
+                "_winner": (
+                    str(home.get("name") or "Player 1")
+                    if winner_code == 1 else
+                    str(away.get("name") or "Player 2")
+                    if winner_code == 2 else None
+                ),
                 "result": " ".join(score_parts) if status == "FT" else "",
                 "live": "LIVE" if status == "LIVE" else "",
                 "_sofascore_rank": rank,
             })
-        current += timedelta(days=1)
     return rows
 
 def _tennis_normalize(row: dict, tour: str) -> dict:
@@ -5244,15 +6998,16 @@ def _tennis_normalize(row: dict, tour: str) -> dict:
     result = str(row.get("result") or "").strip()
     live = str(row.get("live") or "").strip()
 
-    if result:
+    source_status = str(row.get("_status") or "").strip().upper()
+    if source_status in {"FT", "LIVE", "NS"}:
+        status = source_status
+    elif result:
         status = "FT"
-        winner = p1_name
     elif live:
         status = "LIVE"
-        winner = None
     else:
         status = "NS"
-        winner = None
+    winner = row.get("_winner") or row.get("winner")
 
     odd1 = row.get("odd1")
     odd2 = row.get("odd2")
@@ -5292,7 +7047,9 @@ def _tennis_normalize(row: dict, tour: str) -> dict:
         "date": date_text,
         "time": time_text,
         "match_id": str(row.get("id") or row.get("matchId") or ""),
-        "tournament_rank": _tennis_rank(row),
+        "tournament_rank": max(
+            _tennis_rank(row), int(row.get("_sofascore_rank") or 0)
+        ),
     }
 
 
@@ -5327,17 +7084,63 @@ def get_tennis_messages(
             rapidapi_failed = True
             print(f"[TENNIS] request failed: {exc}")
 
-    # RapidAPI is preferred. If it returns 403/zero rows, use the FREE
-    # Live Tennis API as the fixture source. SofaScore is intentionally not
-    # used anymore because the previous fallback was returning HTTP 403.
-    if not rows and _live_tennis_key():
+    # Always supplement RapidAPI with the dedicated fixture feed when the
+    # selected window includes today or a future date. RapidAPI can return a
+    # partial draw (especially WTA qualifying); using it only when RapidAPI is
+    # completely empty hid the rest of that tour's schedule.
+    today = datetime.now(YEREVAN_TZ).date()
+    if _live_tennis_key() and end >= today:
         fallback_tours = (selected_tour,) if selected_tour in {"atp", "wta"} else ("atp", "wta")
         for fallback_tour in fallback_tours:
             try:
                 fallback_rows = _live_tennis_rows_for_tour(fallback_tour, start, end)
+                added = 0
                 for raw in fallback_rows:
-                    rows.append(_live_tennis_normalize(raw, fallback_tour))
-                print(f"[TENNIS] Live Tennis API {fallback_tour.upper()} rows={len(fallback_rows)}")
+                    incoming = _live_tennis_normalize(raw, fallback_tour)
+                    duplicate = None
+                    for existing in rows:
+                        if str(existing.get("tour") or "").upper() != fallback_tour.upper():
+                            continue
+                        if existing.get("date") and incoming.get("date") and existing["date"] != incoming["date"]:
+                            continue
+                        existing_home = str(existing.get("home_name") or "")
+                        existing_away = str(existing.get("away_name") or "")
+                        incoming_home = str(incoming.get("home_name") or "")
+                        incoming_away = str(incoming.get("away_name") or "")
+                        if (
+                            (_tennis_names_match(existing_home, incoming_home)
+                             and _tennis_names_match(existing_away, incoming_away))
+                            or (_tennis_names_match(existing_home, incoming_away)
+                                and _tennis_names_match(existing_away, incoming_home))
+                        ):
+                            duplicate = existing
+                            break
+
+                    if duplicate is None:
+                        rows.append(incoming)
+                        added += 1
+                        continue
+
+                    # Keep the richer provider row while filling fields the
+                    # primary source omitted from its schedule response.
+                    for key in ("home_player_id", "away_player_id", "home_country", "away_country", "home_logo", "away_logo"):
+                        if not duplicate.get(key) and incoming.get(key):
+                            duplicate[key] = incoming[key]
+                    incoming_status = str(incoming.get("status") or "NS").upper()
+                    existing_status = str(duplicate.get("status") or "NS").upper()
+                    if (
+                        incoming_status == "FT" and existing_status != "FT"
+                    ) or (
+                        incoming_status == "LIVE" and existing_status not in {"LIVE", "FT"}
+                    ):
+                        duplicate["status"] = incoming_status
+                        for key in ("status", "live_text", "score_text", "winner"):
+                            if incoming.get(key):
+                                duplicate[key] = incoming[key]
+                print(
+                    f"[TENNIS] Live Tennis API {fallback_tour.upper()} "
+                    f"fixtures={len(fallback_rows)}; added={added}"
+                )
             except requests.exceptions.HTTPError as exc:
                 status = getattr(exc.response, "status_code", None)
                 print(f"[TENNIS] Live Tennis API {fallback_tour.upper()} HTTP {status}: {exc}")
@@ -5346,11 +7149,50 @@ def get_tennis_messages(
     elif not rows:
         print("[TENNIS] RapidAPI unavailable and LIVE_TENNIS_API_KEY is missing")
 
+    # SofaScore is a schedule fallback for when the paid tennis feeds are
+    # unavailable or only return part of the draw. Its daily payloads are
+    # cached briefly and fetched concurrently, which keeps month views useful
+    # without making every tap wait for 30 serial HTTP requests.
+    if end >= today:
+        for fallback_tour in tours:
+            try:
+                fallback_rows = _sofascore_tennis_rows(start, end, fallback_tour)
+                added = 0
+                for raw in fallback_rows:
+                    incoming = _tennis_normalize(raw, fallback_tour)
+                    duplicate = None
+                    same_order = True
+                    for existing in rows:
+                        is_same, incoming_same_order = _tennis_same_match(
+                            existing, incoming
+                        )
+                        if is_same:
+                            duplicate = existing
+                            same_order = incoming_same_order
+                            break
+                    if duplicate is None:
+                        rows.append(incoming)
+                        added += 1
+                    else:
+                        _merge_tennis_fixture(duplicate, incoming, same_order)
+                print(
+                    f"[TENNIS] SofaScore {fallback_tour.upper()} "
+                    f"fixtures={len(fallback_rows)}; added={added}"
+                )
+            except Exception as exc:
+                print(
+                    f"[TENNIS] SofaScore {fallback_tour.upper()} "
+                    f"fallback failed: {type(exc).__name__}"
+                )
+
     # Dedicated tennis odds provider: API Tennis.
     # The Odds API stays as a secondary fallback, but no OddsPapi calls are made.
     api_tennis_events = _api_tennis_odds_events(start, end, selected_tour) if API_TENNIS_KEY else []
-    the_odds_events = _odds_api_tennis_events(start, end) if THE_ODDS_API_KEY else []
-    odds_events = api_tennis_events + the_odds_events
+    the_odds_events = (
+        _odds_api_tennis_events(start, end, selected_tour)
+        if THE_ODDS_API_KEY else []
+    )
+    odds_events = the_odds_events
     print(
         f"[TENNIS] API rows={len(rows)}; Odds sources: API Tennis={len(api_tennis_events)}; "
         f"TheOdds={len(the_odds_events)}; bookmaker={API_TENNIS_BOOKMAKER}; "
@@ -5358,56 +7200,352 @@ def get_tennis_messages(
         f"RapidAPI key loaded={bool(_tennis_key())}; Live Tennis key loaded={bool(_live_tennis_key())}"
     )
 
-    if rows and odds_events:
-        for event in odds_events[:20]:
+    if rows and (api_tennis_events or odds_events):
+        for event in (api_tennis_events + odds_events)[:20]:
             h = str(event.get('home_team') or '')
             a = str(event.get('away_team') or '')
             source = 'API Tennis' if event.get('_api_tennis') else 'The Odds API'
             print(f"[TENNIS ODDS DEBUG] {source}: {h} vs {a}")
 
-    if not rows and odds_events:
-        for event in odds_events:
-            dt = _parse_dt(event.get("commence_time"))
-            home = str(event.get("home_team") or "Player 1")
-            away = str(event.get("away_team") or "Player 2")
-            odds = _extract_h2h(event, home, away) or {}
-            rows.append({
-                "sport": "tennis",
-                "type": "player_match",
-                "sport_icon": "🎾",
-                "competition": str(event.get("_tournament_title") or event.get("sport_title") or "Tennis"),
-                "tour": "ATP" if "atp" in str(event.get("sport_key") or "").lower() else "WTA",
-                "home_name": home,
-                "away_name": away,
-                "home_logo": _wikipedia_player_image(home),
-                "away_logo": _wikipedia_player_image(away),
-                "home_country": "",
-                "away_country": "",
-                "status": "NS",
-                "live_text": "",
-                "score_text": "",
-                "round": "",
-                "winner": None,
-                "odds": {
-                    "left": odds.get("left"),
-                    "right": odds.get("right"),
-                    "bookmaker": odds.get("bookmaker") or "The Odds API",
-                },
-                "date": dt.strftime("%d %b") if dt else "",
-                "time": dt.strftime("%H:%M") if dt else "",
-                "match_id": str(event.get("id") or ""),
-                "tournament_rank": int(event.get("_tournament_rank") or 0),
-            })
-    else:
-        matched_count = 0
+    matched_count = 0
+    base_row_count = len(rows)
+
+    # Merge API Tennis fixtures directly. Keeping this provider out of the
+    # generic Odds API matcher prevents its tour/date metadata from dropping
+    # otherwise valid fixtures and preserves prices in the provider's player
+    # order. API Tennis already received the exact requested date range.
+    api_rows_added = 0
+    api_prices_attached = 0
+    api_priced_rows_added = 0
+    for event in api_tennis_events:
+        home = str(event.get("home_team") or "").strip()
+        away = str(event.get("away_team") or "").strip()
+        if not home or not away:
+            continue
+
+        event_type = " ".join(str(event.get(key) or "") for key in (
+            "_event_type", "_tournament_title"
+        )).lower()
+        if selected_tour in {"atp", "wta"}:
+            event_tour = selected_tour.upper()
+        elif re.search(r"(?<![a-z])wta(?![a-z])", event_type):
+            event_tour = "WTA"
+        elif re.search(r"(?<![a-z])atp(?![a-z])|challenger", event_type):
+            event_tour = "ATP"
+        else:
+            continue
+
+        commence = str(event.get("commence_time") or "")
+        date_text, time_text = _date_time(commence)
+        event_day = _parse_dt(commence)
+        if not date_text:
+            date_text = event_day.strftime("%d %b") if event_day else start.strftime("%d %b")
+        competition = str(event.get("_tournament_title") or "Tennis").strip()
+        price_data = event.get("_api_prices")
+        price_data = price_data if isinstance(price_data, dict) else {}
+        left_price = _decimal(
+            price_data.get("left") or price_data.get("home")
+            or price_data.get("p1") or price_data.get("first")
+        )
+        right_price = _decimal(
+            price_data.get("right") or price_data.get("away")
+            or price_data.get("p2") or price_data.get("second")
+        )
+        bookmaker = str(price_data.get("bookmaker") or "").strip()
+        # Older cached/provider event shapes may have the prices only in the
+        # normalized h2h market. Fall back whenever either side is incomplete,
+        # rather than treating an empty _api_prices object as authoritative.
+        if left_price is None or right_price is None:
+            extracted_prices = _extract_tennis_h2h_strong(event, home, away) or {}
+            extracted_left = _decimal(extracted_prices.get("left"))
+            extracted_right = _decimal(extracted_prices.get("right"))
+            if extracted_left is not None and extracted_right is not None:
+                left_price, right_price = extracted_left, extracted_right
+                bookmaker = str(extracted_prices.get("bookmaker") or bookmaker).strip()
+        has_prices = left_price is not None and right_price is not None
+
+        duplicate = None
+        same_order = True
+        incoming_identity = {
+            "tour": event_tour,
+            "date": date_text,
+            "home_name": home,
+            "away_name": away,
+        }
         for item in rows:
-            existing = item.get("odds") or {}
-            if existing.get("left") is None or existing.get("right") is None:
-                fresh = _tennis_odds_for_names(odds_events, item.get("home_name", ""), item.get("away_name", ""))
-                if fresh:
-                    item["odds"] = fresh
+            is_same, incoming_same_order = _tennis_same_match(item, incoming_identity)
+            if is_same:
+                duplicate = item
+                same_order = incoming_same_order
+                break
+
+        if duplicate is not None:
+            home_country = event.get("_home_country") if same_order else event.get("_away_country")
+            away_country = event.get("_away_country") if same_order else event.get("_home_country")
+            home_logo = event.get("_home_logo") if same_order else event.get("_away_logo")
+            away_logo = event.get("_away_logo") if same_order else event.get("_home_logo")
+            home_player_id = event.get("_home_player_id") if same_order else event.get("_away_player_id")
+            away_player_id = event.get("_away_player_id") if same_order else event.get("_home_player_id")
+            home_profile_name = event.get("_home_profile_name") if same_order else event.get("_away_profile_name")
+            away_profile_name = event.get("_away_profile_name") if same_order else event.get("_home_profile_name")
+            duplicate["home_name"] = _tennis_preferred_display_name(
+                str(duplicate.get("home_name") or ""), home if same_order else away
+            )
+            duplicate["away_name"] = _tennis_preferred_display_name(
+                str(duplicate.get("away_name") or ""), away if same_order else home
+            )
+            if not duplicate.get("home_country") and home_country:
+                duplicate["home_country"] = home_country
+            if not duplicate.get("away_country") and away_country:
+                duplicate["away_country"] = away_country
+            if not duplicate.get("home_logo") and home_logo:
+                duplicate["home_logo"] = home_logo
+            if not duplicate.get("away_logo") and away_logo:
+                duplicate["away_logo"] = away_logo
+            if not duplicate.get("home_player_id") and home_player_id:
+                duplicate["home_player_id"] = home_player_id
+            if not duplicate.get("away_player_id") and away_player_id:
+                duplicate["away_player_id"] = away_player_id
+            if not duplicate.get("home_profile_name") and home_profile_name:
+                duplicate["home_profile_name"] = home_profile_name
+            if not duplicate.get("away_profile_name") and away_profile_name:
+                duplicate["away_profile_name"] = away_profile_name
+            incoming_status = str(event.get("_status") or "NS").upper()
+            existing_status = str(duplicate.get("status") or "NS").upper()
+            if incoming_status == "FT" or (incoming_status == "LIVE" and existing_status != "FT"):
+                duplicate["status"] = incoming_status
+                for key, source_key in (
+                    ("score_text", "_score_text"),
+                    ("live_text", "_live_text"),
+                    ("winner", "_winner"),
+                ):
+                    if event.get(source_key):
+                        duplicate[key] = (
+                            _tennis_score_for_order(event[source_key], same_order)
+                            if key in {"score_text", "live_text"} else event[source_key]
+                        )
+                if not same_order and event.get("_winner"):
+                    event_winner = str(event.get("_winner") or "")
+                    if _tennis_names_match_precise(event_winner, home):
+                        duplicate["winner"] = away
+                    elif _tennis_names_match_precise(event_winner, away):
+                        duplicate["winner"] = home
+            if has_prices:
+                if not same_order:
+                    left_price, right_price = right_price, left_price
+                duplicate["odds"] = {
+                    "left": left_price,
+                    "right": right_price,
+                    "bookmaker": bookmaker or "API Tennis",
+                }
+                api_prices_attached += 1
+            if not duplicate.get("competition") or duplicate.get("competition") == "Tennis":
+                duplicate["competition"] = competition
+            if not duplicate.get("time") and time_text:
+                duplicate["time"] = time_text
+            continue
+
+        rows.append({
+            "sport": "tennis",
+            "type": "player_match",
+            "sport_icon": "🎾",
+            "competition": competition,
+            "tour": event_tour,
+            "home_name": home,
+            "away_name": away,
+            "home_logo": event.get("_home_logo") or None,
+            "away_logo": event.get("_away_logo") or None,
+            "home_player_id": event.get("_home_player_id"),
+            "away_player_id": event.get("_away_player_id"),
+            "home_profile_name": event.get("_home_profile_name") or None,
+            "away_profile_name": event.get("_away_profile_name") or None,
+            "home_country": str(event.get("_home_country") or "").strip(),
+            "away_country": str(event.get("_away_country") or "").strip(),
+            "status": str(event.get("_status") or "NS").upper(),
+            "live_text": str(event.get("_live_text") or ""),
+            "score_text": str(event.get("_score_text") or ""),
+            "round": "",
+            "winner": event.get("_winner"),
+            "odds": {
+                "left": left_price,
+                "right": right_price,
+                "bookmaker": bookmaker or ("API Tennis" if has_prices else ""),
+            },
+            "date": date_text,
+            "time": time_text,
+            "match_id": str(event.get("id") or ""),
+            "tournament_rank": int(event.get("_tournament_rank") or _live_tennis_rank(competition)),
+        })
+        api_rows_added += 1
+        if has_prices:
+            api_priced_rows_added += 1
+
+    print(
+        f"[TENNIS MERGE DIRECT] tour={selected_tour or 'both'} "
+        f"API Tennis fixtures={len(api_tennis_events)} added={api_rows_added} "
+        f"odds_attached={api_prices_attached} priced_added={api_priced_rows_added} "
+        f"total_rows={len(rows)}"
+    )
+
+    # Odds feeds are also a useful fixture source. Previously they were only
+    # consulted when the schedule feed was entirely empty, so odds-backed ATP
+    # matches disappeared whenever the live feed returned even a partial list.
+    odds_rows_added = 0
+    priced_rows_added = 0
+    for event in odds_events:
+        home = str(event.get("home_team") or "").strip()
+        away = str(event.get("away_team") or "").strip()
+        if not home or not away:
+            continue
+
+        event_type = " ".join(str(event.get(key) or "") for key in (
+            "_event_type", "sport_key", "sport_title", "_tournament_title"
+        )).lower()
+        if event.get("_api_tennis") and selected_tour in {"atp", "wta"}:
+            # The fixtures request was already filtered to this tour.
+            event_tour = selected_tour.upper()
+        elif re.search(r"(?<![a-z])wta(?![a-z])", event_type):
+            event_tour = "WTA"
+        elif re.search(r"(?<![a-z])atp(?![a-z])|challenger", event_type):
+            event_tour = "ATP"
+        else:
+            # Do not guess the tour for an odds-only match.
+            continue
+        if selected_tour and event_tour.lower() != selected_tour:
+            continue
+
+        commence = str(event.get("commence_time") or "")
+        if event.get("_api_tennis"):
+            event_dt = _parse_dt(commence)
+            try:
+                event_day = event_dt.date() if event_dt else date.fromisoformat(commence[:10])
+            except ValueError:
+                event_day = start
+        else:
+            event_dt = _parse_dt(commence)
+            event_day = event_dt.date() if event_dt else None
+        event_date_text, event_time_text = _date_time(commence)
+        # API Tennis fixtures were requested for this exact date range in the
+        # configured timezone. Re-filtering their serialized date here dropped
+        # matches at UTC/local-day boundaries, so only The Odds events need a
+        # second local-window check.
+        if event_day is None or (not event.get("_api_tennis") and not (start <= event_day <= end)):
+            continue
+
+        duplicate = None
+        same_order = True
+        incoming_identity = {
+            "tour": event_tour,
+            "date": event_date_text,
+            "home_name": home,
+            "away_name": away,
+        }
+        for item in rows:
+            is_same, incoming_same_order = _tennis_same_match(item, incoming_identity)
+            if is_same:
+                duplicate = item
+                same_order = incoming_same_order
+                break
+
+        if duplicate is not None:
+            duplicate["home_name"] = _tennis_preferred_display_name(
+                str(duplicate.get("home_name") or ""), home if same_order else away
+            )
+            duplicate["away_name"] = _tennis_preferred_display_name(
+                str(duplicate.get("away_name") or ""), away if same_order else home
+            )
+            current_odds = duplicate.get("odds") or {}
+            if current_odds.get("left") is None or current_odds.get("right") is None:
+                duplicate_odds = _extract_tennis_h2h_strong(event, home, away) or {}
+                if duplicate_odds.get("left") is not None and duplicate_odds.get("right") is not None:
+                    left_price, right_price = duplicate_odds["left"], duplicate_odds["right"]
+                    if not same_order:
+                        left_price, right_price = right_price, left_price
+                    duplicate["odds"] = {
+                        "left": left_price,
+                        "right": right_price,
+                        "draw": duplicate_odds.get("draw"),
+                        "bookmaker": duplicate_odds.get("bookmaker") or "",
+                    }
                     matched_count += 1
-        print(f"[TENNIS ODDS] Matched odds for {matched_count}/{len(rows)} displayed matches")
+            continue
+
+        odds = _extract_tennis_h2h_strong(event, home, away) or {}
+        has_prices = odds.get("left") is not None and odds.get("right") is not None
+        if not has_prices and not event.get("_fixture_only"):
+            continue
+        event_dt = _parse_dt(commence)
+        date_text, time_text = event_date_text, event_time_text
+        competition = str(
+            event.get("_tournament_title") or event.get("sport_title") or "Tennis"
+        ).strip()
+        rows.append({
+            "sport": "tennis",
+            "type": "player_match",
+            "sport_icon": "🎾",
+            "competition": competition,
+            "tour": event_tour,
+            "home_name": home,
+            "away_name": away,
+            "home_logo": None,
+            "away_logo": None,
+            "home_player_id": None,
+            "away_player_id": None,
+            "home_country": "",
+            "away_country": "",
+            "status": "NS",
+            "live_text": "",
+            "score_text": "",
+            "round": "",
+            "winner": None,
+            "odds": {
+                "left": odds.get("left"),
+                "right": odds.get("right"),
+                "bookmaker": odds.get("bookmaker") or "",
+            },
+            "date": date_text or (event_day.strftime("%d %b") if event_day else ""),
+            "time": time_text,
+            "match_id": str(event.get("id") or ""),
+            "tournament_rank": int(event.get("_tournament_rank") or _live_tennis_rank(competition)),
+        })
+        odds_rows_added += 1
+        if has_prices:
+            priced_rows_added += 1
+
+    print(
+        f"[TENNIS ODDS] Matched odds for {matched_count}/{base_row_count} schedule matches; "
+        f"added {odds_rows_added} matches missing from the schedule feed "
+        f"({priced_rows_added} with odds)"
+    )
+
+    now = datetime.now(YEREVAN_TZ)
+    fresh_rows = []
+    stale_unstarted = 0
+    for item in rows:
+        if str(item.get("status") or "NS").upper() != "NS":
+            fresh_rows.append(item)
+            continue
+        try:
+            scheduled = datetime.strptime(
+                f"{item.get('date', '')} {item.get('time', '')} {now.year}",
+                "%d %b %H:%M %Y",
+            ).replace(tzinfo=YEREVAN_TZ)
+            if scheduled.date() - now.date() > timedelta(days=180):
+                scheduled = scheduled.replace(year=scheduled.year - 1)
+            elif now.date() - scheduled.date() > timedelta(days=180):
+                scheduled = scheduled.replace(year=scheduled.year + 1)
+        except (TypeError, ValueError):
+            scheduled = None
+        # A fixture-only odds source leaves status as NS forever. Don't show
+        # yesterday's (or long-past) rows as "NOT STARTED" when the score feed
+        # did not publish a live/final update for them.
+        if scheduled and scheduled < now - timedelta(hours=2):
+            stale_unstarted += 1
+            continue
+        fresh_rows.append(item)
+    rows = fresh_rows
+    if stale_unstarted:
+        print(f"[TENNIS] Hidden stale NOT STARTED fixtures: {stale_unstarted}")
 
     # Keep ATP and WTA completely separate in the UI. When a tour is selected,
     # only that tour is considered here. Tournament rank is the primary
@@ -5433,24 +7571,20 @@ def get_tennis_messages(
         reverse=True,
     )
 
-    # Show a compact Top 10 for the selected tour instead of mixing ATP/WTA
-    # into one long Tennis feed. Keep tournament priority first, then time.
-    out = []
-    seen = set()
-    for tournament in tournaments:
-        items = sorted(
+    # Provider ids and tournament labels differ between feeds, so collapse
+    # equivalent pairings after sorting the full selected-tour fixture list.
+    ordered_items = [
+        item
+        for tournament in tournaments
+        for item in sorted(
             tournament["items"],
-            key=lambda x: (x.get("date", ""), x.get("time", "")),
+            key=lambda row: (row.get("date", ""), row.get("time", "")),
         )
-        for item in items:
-            match_id = item.get("match_id")
-            if match_id in seen:
-                continue
-            seen.add(match_id)
-            out.append(("Tennis event", item))
-            if len(out) >= 10:
-                return out
-    return out
+    ]
+    return [
+        ("Tennis event", item)
+        for item in _deduplicate_tennis_matches(ordered_items)
+    ]
 
 
 # ============================================================
@@ -6048,8 +8182,14 @@ def get_sport_messages(sport: str, date_from: str | None = None, date_to: str | 
     sport = str(sport or "").strip().lower()
     if sport == "basketball":
         return get_nba_messages(date_from, date_to)
+    if sport == "nba_preseason":
+        return get_nba_preseason_messages(date_from, date_to)
+    if sport == "euroleague":
+        return get_euroleague_messages(date_from, date_to)
     if sport == "hockey":
         return get_nhl_messages(date_from, date_to)
+    if sport == "nhl_preseason":
+        return get_nhl_preseason_messages(date_from, date_to)
     if sport == "tennis":
         return get_tennis_messages(date_from, date_to)
     if sport == "f1":

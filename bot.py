@@ -6,8 +6,8 @@ Multi-Sport Telegram Bot
 Features:
 - Sport selection on /start
 - ⚽ Football: existing league / period flow
-- 🏀 Basketball: NBA daily scoreboard
-- 🏒 Hockey: NHL daily scoreboard
+- 🏀 Basketball: NBA, NBA preseason, and EuroLeague
+- 🏒 Hockey: NHL and NHL preseason
 - 🎾 Tennis: ATP/WTA top tournaments
 - 🏎️ Formula 1: current-season race schedule
 - Back navigation
@@ -29,6 +29,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -263,6 +264,172 @@ def _get_font(size: int, bold: bool = False):
     return ImageFont.load_default()
 
 
+# Tennis APIs return three-letter IOC country codes (for example FRA or POL).
+# Use flag emoji in fallback Telegram text and actual flag images in PNG cards.
+_TENNIS_COUNTRY_ISO2 = {
+    "AFG": "AF", "ALB": "AL", "ALG": "DZ", "AND": "AD", "ANG": "AO",
+    "ANT": "AG", "ARG": "AR", "ARM": "AM", "ARU": "AW", "AUS": "AU",
+    "AUT": "AT", "AZE": "AZ", "BAH": "BS", "BAN": "BD", "BAR": "BB",
+    "BEL": "BE", "BEN": "BJ", "BER": "BM", "BHU": "BT", "BIH": "BA",
+    "BIZ": "BZ", "BLR": "BY", "BOL": "BO", "BOT": "BW", "BRA": "BR",
+    "BRN": "BH", "BUL": "BG", "BUR": "BF", "CAM": "KH", "CAN": "CA",
+    "CHI": "CL", "CHN": "CN", "CIV": "CI", "CMR": "CM", "COL": "CO",
+    "CRC": "CR", "CRO": "HR", "CUB": "CU", "CYP": "CY", "CZE": "CZ",
+    "DEN": "DK", "DOM": "DO", "ECU": "EC", "EGY": "EG", "ESA": "SV",
+    "ESP": "ES", "EST": "EE", "FIN": "FI", "FRA": "FR", "GBR": "GB",
+    "GEO": "GE", "GER": "DE", "GHA": "GH", "GRE": "GR", "GUA": "GT",
+    "HKG": "HK", "HON": "HN", "HUN": "HU", "IND": "IN", "INA": "ID",
+    "IRI": "IR", "IRL": "IE", "ISL": "IS", "ISR": "IL", "ITA": "IT",
+    "JAM": "JM", "JPN": "JP", "KAZ": "KZ", "KEN": "KE", "KGZ": "KG",
+    "KOR": "KR", "KOS": "XK", "KSA": "SA", "KUW": "KW", "LAT": "LV",
+    "LBN": "LB", "LIB": "LB", "LIE": "LI", "LTU": "LT", "LUX": "LU",
+    "MAD": "MG", "MAR": "MA", "MAS": "MY", "MDA": "MD", "MEX": "MX",
+    "MKD": "MK", "MLT": "MT", "MNE": "ME", "MON": "MC", "MRI": "MU",
+    "NED": "NL", "NEP": "NP", "NGR": "NG", "NOR": "NO", "NZL": "NZ",
+    "PAK": "PK", "PAN": "PA", "PAR": "PY", "PER": "PE", "PHI": "PH",
+    "POL": "PL", "POR": "PT", "PUR": "PR", "QAT": "QA", "ROU": "RO",
+    "RSA": "ZA", "RUS": "RU", "SAM": "WS", "SEN": "SN", "SEY": "SC",
+    "SGP": "SG", "SLO": "SI", "SMR": "SM", "SRB": "RS", "SRI": "LK",
+    "SVK": "SK", "SWE": "SE", "SUI": "CH", "SYR": "SY", "THA": "TH",
+    "TJK": "TJ", "TKM": "TM", "TPE": "TW", "TUN": "TN", "TUR": "TR",
+    "UAE": "AE", "UGA": "UG", "UKR": "UA", "URU": "UY", "USA": "US",
+    "UZB": "UZ", "VEN": "VE", "VIE": "VN", "ZAM": "ZM", "ZIM": "ZW",
+    # ISO-3166 alpha-3 aliases some roster APIs return instead of IOC codes.
+    "DEU": "DE", "NLD": "NL", "CHE": "CH", "GRC": "GR", "HRV": "HR",
+    "SVN": "SI", "PRT": "PT", "URY": "UY", "ZAF": "ZA", "TWN": "TW",
+    "CHL": "CL", "MYS": "MY", "IDN": "ID", "PHL": "PH", "ARE": "AE",
+    "SAU": "SA", "IRN": "IR", "VNM": "VN", "ZWE": "ZW", "ZMB": "ZM",
+}
+
+_TENNIS_COUNTRY_NAME_CODES = {
+    "UNITED STATES": "USA", "UNITED STATES OF AMERICA": "USA",
+    "UNITED KINGDOM": "GBR", "GREAT BRITAIN": "GBR", "ENGLAND": "GBR",
+    "CZECH REPUBLIC": "CZE", "NETHERLANDS": "NED", "SWITZERLAND": "SUI",
+    "SOUTH KOREA": "KOR", "KOREA, REPUBLIC OF": "KOR", "TAIWAN": "TPE",
+    "CHINESE TAIPEI": "TPE", "RUSSIA": "RUS", "TÜRKIYE": "TUR",
+    "TURKEY": "TUR", "CHINA": "CHN", "FRANCE": "FRA", "POLAND": "POL",
+    "GERMANY": "GER", "SPAIN": "ESP", "ITALY": "ITA", "SERBIA": "SRB",
+    "AUSTRALIA": "AUS", "CANADA": "CAN", "JAPAN": "JPN", "GREECE": "GRE",
+    "BRAZIL": "BRA", "ARGENTINA": "ARG", "UK": "GBR", "USA": "USA",
+    "CZECHIA": "CZE", "SLOVAKIA": "SVK", "SLOVENIA": "SLO",
+    "CROATIA": "CRO", "BOSNIA AND HERZEGOVINA": "BIH",
+    "BOSNIA & HERZEGOVINA": "BIH", "MONTENEGRO": "MNE",
+    "NORTH MACEDONIA": "MKD", "MACEDONIA": "MKD", "MOLDOVA": "MDA",
+    "HONG KONG": "HKG", "HUNGARY": "HUN", "UKRAINE": "UKR",
+    "UZBEKISTAN": "UZB", "TUNISIA": "TUN", "MEXICO": "MEX",
+    "PHILIPPINES": "PHI", "PUERTO RICO": "PUR", "CHILE": "CHI",
+    "SOUTH AFRICA": "RSA", "NEW ZEALAND": "NZL", "ROMANIA": "ROU",
+    "BULGARIA": "BUL", "INDIA": "IND", "ISRAEL": "ISR", "KAZAKHSTAN": "KAZ",
+    "ARMENIA": "ARM", "AUSTRIA": "AUT", "BELGIUM": "BEL",
+    "COLOMBIA": "COL", "DENMARK": "DEN", "INDONESIA": "INA",
+    "LATVIA": "LAT", "THAILAND": "THA",
+}
+
+
+def _tennis_country_flag(country_code: str | None) -> str:
+    iso2 = _tennis_country_iso2(country_code)
+    if not iso2:
+        return ""
+    return "".join(chr(0x1F1E6 + ord(char) - ord("A")) for char in iso2)
+
+
+def _tennis_country_iso2(country_code: str | None) -> str:
+    raw = " ".join(str(country_code or "").strip().upper().replace(".", "").split())
+    if not raw:
+        return ""
+    raw = _TENNIS_COUNTRY_NAME_CODES.get(raw, raw)
+    iso2 = _TENNIS_COUNTRY_ISO2.get(raw, raw)
+    if len(iso2) == 2 and iso2.isalpha():
+        return iso2
+    # Some providers return labels such as "France (FRA)" or "USA - United
+    # States" instead of a single IOC/ISO code. Recover a known code token.
+    for token in reversed(raw.replace("-", " ").replace("/", " ").split()):
+        candidate = _TENNIS_COUNTRY_ISO2.get(token, token)
+        if len(candidate) == 2 and candidate.isalpha():
+            return candidate
+    return ""
+
+
+def _format_tennis_player_name(country_code: str | None, player_name: str) -> str:
+    name = str(player_name or "Player").strip()
+    flag = _tennis_country_flag(country_code)
+    return f"{flag} {name}" if flag else name
+
+
+def _center_tennis_player_label(
+    draw,
+    country_code: str | None,
+    player_name: str,
+    center_x: int,
+    y: int,
+    max_width: int,
+    size: int = 26,
+    prefix: str = "",
+    suffix: str = "",
+    canvas: Image.Image | None = None,
+) -> None:
+    """Draw a centered player label with a small flag image and no country code."""
+    name = str(player_name or "Player").strip()
+    iso2 = _tennis_country_iso2(country_code)
+    flag_emoji = _tennis_country_flag(country_code)
+    flag_image = (
+        _download_asset(f"https://flagcdn.com/w40/{iso2.lower()}.png")
+        if iso2 else None
+    )
+    flag_font = None
+    if flag_emoji and flag_image is None and canvas is not None:
+        try:
+            flag_font = ImageFont.truetype("C:/Windows/Fonts/seguiemj.ttf", 20)
+        except OSError:
+            flag_font = _get_font(18)
+    show_flag = flag_image is not None or flag_font is not None
+    flag_width, flag_height = (28, 18) if show_flag and canvas is not None else (0, 0)
+    gap = 7 if flag_width else 0
+    for font_size in range(size, 15, -1):
+        name_font = _get_font(font_size, bold=True)
+        prefix_bbox = draw.textbbox((0, 0), prefix, font=name_font) if prefix else (0, 0, 0, 0)
+        name_bbox = draw.textbbox((0, 0), name, font=name_font)
+        suffix_bbox = draw.textbbox((0, 0), suffix, font=name_font) if suffix else (0, 0, 0, 0)
+        prefix_width = prefix_bbox[2] - prefix_bbox[0]
+        name_width = name_bbox[2] - name_bbox[0]
+        suffix_width = suffix_bbox[2] - suffix_bbox[0]
+        total_width = prefix_width + (flag_width + gap if flag_width else 0) + name_width + suffix_width
+        if total_width <= max_width or font_size == 16:
+            break
+
+    x = center_x - total_width / 2
+    if prefix:
+        draw.text((x, y), prefix, font=name_font, fill=(244, 248, 247))
+        x += prefix_width
+    if flag_width and canvas is not None:
+        flag_x = int(round(x))
+        if flag_image is not None:
+            flag_icon = ImageOps.contain(
+                flag_image, (flag_width - 2, flag_height - 2), method=Image.Resampling.LANCZOS
+            )
+            flag_y = int(y + max(2, (font_size - flag_icon.height) // 2))
+            draw.rounded_rectangle(
+                (flag_x - 1, flag_y - 1, flag_x + flag_icon.width, flag_y + flag_icon.height),
+                radius=2,
+                fill=(244, 248, 247),
+            )
+            canvas.paste(
+                flag_icon,
+                (flag_x, flag_y),
+                flag_icon if flag_icon.mode == "RGBA" else None,
+            )
+        elif flag_emoji:
+            try:
+                draw.text((flag_x, y - 1), flag_emoji, font=flag_font, embedded_color=True)
+            except Exception:
+                draw.text((flag_x, y - 1), flag_emoji, font=flag_font, fill=(245, 249, 248))
+        x += flag_width + gap
+    draw.text((x, y), name, font=name_font, fill=(244, 248, 247))
+    x += name_width
+    if suffix:
+        draw.text((x, y), suffix, font=name_font, fill=(244, 248, 247))
+
+
 # ============================================================
 # /start
 # ============================================================
@@ -370,6 +537,24 @@ SPORT_PERIOD_LABELS = {
     "month": "📆 This Month",
 }
 
+SPORT_VARIANTS = {
+    "basketball": (
+        ("nba", "🏀 NBA"),
+        ("nba_preseason", "🏀 NBA Preseason"),
+        ("euroleague", "🏆 EuroLeague"),
+    ),
+    "hockey": (
+        ("nhl", "🏒 NHL"),
+        ("nhl_preseason", "🏒 NHL Preseason"),
+    ),
+}
+
+SPORT_VARIANT_LABELS = {
+    variant: label
+    for options in SPORT_VARIANTS.values()
+    for variant, label in options
+}
+
 
 def _tennis_tour_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -379,6 +564,21 @@ def _tennis_tour_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("⬅️ Sports", callback_data="back_to_start")],
     ])
+
+
+def _sport_variant_keyboard(sport: str) -> InlineKeyboardMarkup:
+    options = SPORT_VARIANTS.get(sport, ())
+    keyboard = [
+        [InlineKeyboardButton(label, callback_data=f"sport_variant:{sport}:{variant}")]
+        for variant, label in options
+    ]
+    keyboard.append([InlineKeyboardButton("⬅️ Sports", callback_data="back_to_start")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _sport_variant_title(sport: str) -> str:
+    names = {"basketball": "🏀 Basketball", "hockey": "🏒 Hockey"}
+    return f"{names.get(sport, SPORT_LABELS.get(sport, sport))}\n\n🏆 Choose competition"
 
 
 def _sport_period_keyboard(sport: str) -> InlineKeyboardMarkup:
@@ -404,19 +604,32 @@ def _sport_back_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
-def _sport_period_title(sport: str, period: str) -> str:
+def _sport_display_label(sport: str, sport_variant: str | None = None) -> str:
+    if sport_variant:
+        return SPORT_VARIANT_LABELS.get(
+            sport_variant, SPORT_LABELS.get(sport, sport)
+        )
     names = {
         "basketball": "🏀 NBA",
         "hockey": "🏒 NHL",
         "tennis": "🎾 Tennis",
     }
-    return f"{names.get(sport, SPORT_LABELS.get(sport, sport))}\n\n📅 Choose a period"
+    return names.get(sport, SPORT_LABELS.get(sport, sport))
+
+
+def _sport_period_title(
+    sport: str,
+    period: str,
+    sport_variant: str | None = None,
+) -> str:
+    return f"{_sport_display_label(sport, sport_variant)}\n\n📅 Choose a period"
 
 
 async def _sport_messages(
     sport: str,
     period: str | None = None,
     tennis_tour: str | None = None,
+    sport_variant: str | None = None,
 ):
     """Fetch normalized non-football event objects from api.py."""
     if sport == "f1":
@@ -425,8 +638,24 @@ async def _sport_messages(
     period = period or "today"
     date_from, date_to = api.get_date_range(period)
     if sport == "tennis":
+        if period == "today":
+            # Football keeps its wider UTC boundary window and filters it
+            # afterwards; tennis cards should never pull yesterday's stale
+            # odds-only fixtures into today's list.
+            local_today = datetime.now(YEREVAN_TZ).date().isoformat()
+            date_from = date_to = local_today
         return await asyncio.to_thread(
             api.get_tennis_messages, date_from, date_to, tennis_tour
+        )
+    if sport == "basketball":
+        fetcher = {
+            "nba_preseason": api.get_nba_preseason_messages,
+            "euroleague": api.get_euroleague_messages,
+        }.get(sport_variant, api.get_nba_messages)
+        return await asyncio.to_thread(fetcher, date_from, date_to)
+    if sport == "hockey" and sport_variant == "nhl_preseason":
+        return await asyncio.to_thread(
+            api.get_nhl_preseason_messages, date_from, date_to
         )
     return await asyncio.to_thread(api.get_sport_messages, sport, date_from, date_to)
 
@@ -461,9 +690,40 @@ async def handle_sport_selection(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
+    if sport in SPORT_VARIANTS:
+        context.user_data["screen"] = "sport_variant_selection"
+        await query.edit_message_text(
+            _sport_variant_title(sport),
+            reply_markup=_sport_variant_keyboard(sport),
+        )
+        return
+
     context.user_data["screen"] = "sport_period_selection"
     await query.edit_message_text(
         _sport_period_title(sport, "today"),
+        reply_markup=_sport_period_keyboard(sport),
+    )
+
+
+async def handle_sport_variant_selection(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, sport, variant = query.data.split(":", 2)
+    allowed = {key for key, _ in SPORT_VARIANTS.get(sport, ())}
+    if variant not in allowed:
+        await query.answer("Unknown competition.", show_alert=True)
+        return
+
+    context.user_data["sport"] = sport
+    context.user_data["sport_variant"] = variant
+    context.user_data["mode"] = f"sport_{sport}"
+    context.user_data["screen"] = "sport_period_selection"
+    await query.edit_message_text(
+        _sport_period_title(sport, "today", variant),
         reply_markup=_sport_period_keyboard(sport),
     )
 
@@ -500,7 +760,12 @@ async def handle_sport_period_selection(update: Update, context: ContextTypes.DE
     context.user_data["screen"] = "sport_matches"
 
     await _show_sport_matches(
-        query, context, sport, period, context.user_data.get("tennis_tour")
+        query,
+        context,
+        sport,
+        period,
+        context.user_data.get("tennis_tour"),
+        context.user_data.get("sport_variant"),
     )
 
 
@@ -510,6 +775,7 @@ async def _show_sport_matches(
     sport: str,
     period: str | None = None,
     tennis_tour: str | None = None,
+    sport_variant: str | None = None,
 ) -> None:
     await _clear_previous_match_messages(query, context)
 
@@ -520,13 +786,17 @@ async def _show_sport_matches(
         context.user_data["period"] = period
     if sport == "tennis" and tennis_tour:
         context.user_data["tennis_tour"] = tennis_tour.lower()
+    if sport_variant:
+        context.user_data["sport_variant"] = sport_variant
+    sport_variant = context.user_data.get("sport_variant")
+    sport_label = _sport_display_label(sport, sport_variant)
 
     if sport == "f1":
         loading_text = "🏎️ Formula 1\n\n⏳ Loading current Grand Prix..."
     else:
         period = period or context.user_data.get("period", "today")
         period_name = SPORT_PERIOD_LABELS.get(period, "📅 Today")
-        loading_text = f"{SPORT_LABELS.get(sport, sport)}\n\n{period_name}\n\n⏳ Fetching games..."
+        loading_text = f"{sport_label}\n\n{period_name}\n\n⏳ Fetching games..."
 
     await _edit_navigation_message(
         query,
@@ -535,16 +805,27 @@ async def _show_sport_matches(
         reply_markup=_sport_nav_keyboard(),
     )
 
+    fetch_started = time.perf_counter()
     try:
         items = await _sport_messages(
-            sport, period, context.user_data.get("tennis_tour")
+            sport,
+            period,
+            context.user_data.get("tennis_tour"),
+            sport_variant,
+        )
+        logger.info(
+            "[SPORT] %s %s returned %d event(s) in %.1fs",
+            sport,
+            period or "current",
+            len(items),
+            time.perf_counter() - fetch_started,
         )
     except Exception as exc:
         logger.exception("Could not fetch %s data", sport)
         await _edit_navigation_message(
             query,
             context,
-            f"{SPORT_LABELS.get(sport, sport)}\n\n⚠️ Could not fetch data.\n\n{exc}",
+            f"{sport_label}\n\n⚠️ Could not fetch data.\n\n{exc}",
             reply_markup=_sport_nav_keyboard(),
         )
         return
@@ -553,7 +834,7 @@ async def _show_sport_matches(
         if sport == "f1":
             empty_title = "🏎️ Formula 1"
         else:
-            empty_title = f"{SPORT_LABELS.get(sport, sport)}\n\n{SPORT_PERIOD_LABELS.get(period or 'today', '📅 Today')}"
+            empty_title = f"{sport_label}\n\n{SPORT_PERIOD_LABELS.get(period or 'today', '📅 Today')}"
         await _edit_navigation_message(
             query,
             context,
@@ -569,7 +850,7 @@ async def _show_sport_matches(
         tour_label = str(context.user_data.get("tennis_tour") or "ATP").upper()
         item_label = f"🎾 Tennis — {tour_label} • {SPORT_PERIOD_LABELS.get(period or 'today', '📅 Today')}"
     else:
-        item_label = f"{SPORT_LABELS.get(sport, sport)} • {SPORT_PERIOD_LABELS.get(period or 'today', '📅 Today')}"
+        item_label = f"{sport_label} • {SPORT_PERIOD_LABELS.get(period or 'today', '📅 Today')}"
 
     await _edit_navigation_message(
         query,
@@ -584,7 +865,17 @@ async def _show_sport_matches(
     for index, (fallback_text, item) in enumerate(items):
         keyboard = _sport_back_keyboard() if index == len(items) - 1 else None
         try:
+            card_started = time.perf_counter()
             card = await asyncio.to_thread(_create_sport_card, item)
+            card_elapsed = time.perf_counter() - card_started
+            if card_elapsed >= 2.5:
+                logger.warning(
+                    "[SPORT] %s card %d/%d took %.1fs to render",
+                    sport,
+                    index + 1,
+                    len(items),
+                    card_elapsed,
+                )
             message = await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=InputFile(card, filename="sport_card.png"),
@@ -1083,11 +1374,19 @@ def _prepare_logo(logo: Image.Image, size: int) -> Image.Image:
 # ============================================================
 
 
-def _download_asset(url: str | None):
+@lru_cache(maxsize=512)
+def _download_asset(url: str | None, timeout: float | None = None):
     if not url:
         return None
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {
+            "User-Agent": "MySportInfoBot/1.0 (sports match-card image previews)",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        }
+        if "upload.wikimedia.org" in url:
+            headers["Referer"] = "https://en.wikipedia.org/"
+        elif "sofascore.com" in url:
+            headers["Referer"] = "https://www.sofascore.com/"
         # Tennis API player photos are served from the RapidAPI host and
         # require the same RapidAPI authorization as the JSON endpoints.
         if "tennis-api-atp-wta-itf.p.rapidapi.com" in url:
@@ -1097,7 +1396,9 @@ def _download_asset(url: str | None):
                     "X-RapidAPI-Key": rapid_key,
                     "X-RapidAPI-Host": "tennis-api-atp-wta-itf.p.rapidapi.com",
                 })
-        response = requests.get(url, timeout=10, headers=headers)
+        response = requests.get(
+            url, timeout=10 if timeout is None else timeout, headers=headers
+        )
         response.raise_for_status()
         content_type = str(response.headers.get("Content-Type", "")).lower()
         data = response.content
@@ -1113,6 +1414,39 @@ def _download_asset(url: str | None):
     except Exception as exc:
         logger.warning("Could not download sport asset: %s", exc)
         return None
+
+
+def _download_tennis_player_asset(item: dict, side: str):
+    """Try the provider photo first, then fall back to the player's Wikipedia portrait."""
+    logo_url = item.get(f"{side}_logo")
+    asset = _download_asset(logo_url, timeout=4)
+    if asset is not None:
+        return asset
+
+    player_name = str(
+        item.get(f"{side}_profile_name") or item.get(f"{side}_name") or ""
+    ).strip()
+    image_lookup = getattr(api, "_wikipedia_player_image", None)
+    if not player_name or not callable(image_lookup):
+        return None
+
+    player_id = item.get(f"{side}_player_id")
+    player_tour = item.get("tour")
+    try:
+        # Keep card rendering bounded when a provider omits the portrait.
+        fallback_url = image_lookup(player_name, player_id, player_tour, fast=True)
+    except TypeError:
+        try:
+            fallback_url = image_lookup(player_name, player_id, player_tour)
+        except TypeError:
+            # Keep compatibility with older one-argument image resolvers.
+            fallback_url = image_lookup(player_name)
+    except Exception:
+        logger.debug("Could not resolve fallback portrait for %s", player_name, exc_info=True)
+        return None
+    if not fallback_url or fallback_url == logo_url:
+        return None
+    return _download_asset(fallback_url, timeout=4)
 
 
 def _paste_round_asset(image: Image.Image, asset, center_x: int, center_y: int, size: int):
@@ -1153,10 +1487,11 @@ def _sport_status_label(item: dict) -> str:
 
 
 def _sport_score(item: dict) -> str:
-    if str(item.get("status") or "NS").upper() == "NS":
+    status = str(item.get("status") or "NS").upper()
+    if status == "NS":
         return "VS"
     if item.get("type") == "player_match":
-        return str(item.get("score_text") or "LIVE")
+        return str(item.get("score_text") or ("FINISHED" if status == "FT" else "LIVE"))
     home = item.get("home_score")
     away = item.get("away_score")
     if home is None and away is None:
@@ -1164,12 +1499,24 @@ def _sport_score(item: dict) -> str:
     return f"{home if home is not None else 0}  -  {away if away is not None else 0}"
 
 
-def _draw_sport_odds(draw, centered_text, item: dict, center_y: int = 360):
+def _draw_sport_odds(
+    draw, centered_text, item: dict, center_y: int = 360, canvas: Image.Image | None = None
+):
     odds = item.get("odds") or {}
     left = odds.get("left")
     right = odds.get("right")
     middle = odds.get("draw")
     if left is None and right is None and middle is None:
+        if item.get("type") == "player_match":
+            draw.line((120, center_y - 18, 780, center_y - 18), fill=(37, 61, 63), width=1)
+            centered_text(
+                "ODDS NOT AVAILABLE",
+                450,
+                center_y + 8,
+                _get_font(15, bold=True),
+                (139, 166, 163),
+            )
+            return center_y + 40
         if str(item.get("sport") or "").lower() == "hockey":
             draw.line((120, center_y - 18, 780, center_y - 18), fill=(37, 61, 63), width=1)
             centered_text("ODDS", 450, center_y, _get_font(14, bold=True), (139, 166, 163))
@@ -1205,6 +1552,30 @@ def _draw_sport_odds(draw, centered_text, item: dict, center_y: int = 360):
             (f"X  {val(middle)}", 450),
             (f"2  {val(right)}", 670),
         ]
+    elif item.get("type") == "player_match":
+        _center_tennis_player_label(
+            draw,
+            item.get("home_country"),
+            str(item.get("home_name") or "Player 1"),
+            250,
+            center_y + 28,
+            360,
+            size=20,
+            suffix=f"  {val(left)}",
+            canvas=canvas,
+        )
+        _center_tennis_player_label(
+            draw,
+            item.get("away_country"),
+            str(item.get("away_name") or "Player 2"),
+            650,
+            center_y + 28,
+            360,
+            size=20,
+            suffix=f"  {val(right)}",
+            canvas=canvas,
+        )
+        return center_y + 70
     else:
         parts = [
             (f"{str(item.get('home_name') or '1')[:18]}  {val(left)}", 250),
@@ -1335,21 +1706,65 @@ def _create_sport_tennis_card(item: dict) -> io.BytesIO:
     draw.line((30, 78, 870, 78), fill=(37, 61, 63), width=1)
 
     p1, p2 = str(item.get("home_name") or "Player 1"), str(item.get("away_name") or "Player 2")
-    _paste_round_asset(image, _download_asset(item.get("home_logo")), 165, 170, 125)
-    _paste_round_asset(image, _download_asset(item.get("away_logo")), 735, 170, 125)
+    details_lookup = getattr(api, "_live_tennis_player_details", None)
+    country_lookup = getattr(api, "_live_tennis_player_country", None)
+    for side, player_name in (("home", p1), ("away", p2)):
+        country_key = f"{side}_country"
+        try:
+            profile = {}
+            if callable(details_lookup) and (
+                not item.get(country_key) or not item.get(f"{side}_logo")
+            ):
+                try:
+                    profile = details_lookup(
+                        player_name,
+                        item.get(f"{side}_player_id"),
+                        timeout=2.5,
+                    ) or {}
+                except TypeError:
+                    profile = details_lookup(
+                        player_name, item.get(f"{side}_player_id")
+                    ) or {}
+            if not item.get(country_key) and profile.get("country"):
+                item[country_key] = profile["country"]
+            if not item.get(f"{side}_logo") and profile.get("image"):
+                item[f"{side}_logo"] = profile["image"]
+            if not item.get(f"{side}_player_id") and profile.get("id"):
+                item[f"{side}_player_id"] = profile["id"]
+            if profile.get("name"):
+                item[f"{side}_profile_name"] = profile["name"]
+        except Exception:
+            logger.debug("Could not resolve tennis profile for %s", player_name, exc_info=True)
+        if not item.get(country_key) and callable(country_lookup):
+            try:
+                try:
+                    item[country_key] = country_lookup(
+                        player_name, item.get("tour"), timeout=2.5
+                    )
+                except TypeError:
+                    item[country_key] = country_lookup(
+                        player_name, item.get("tour")
+                    )
+            except TypeError:
+                try:
+                    item[country_key] = country_lookup(player_name)
+                except Exception:
+                    logger.debug("Could not resolve tennis nationality for %s", player_name, exc_info=True)
+            except Exception:
+                logger.debug("Could not resolve tennis nationality for %s", player_name, exc_info=True)
+    _paste_round_asset(image, _download_tennis_player_asset(item, "home"), 165, 170, 125)
+    _paste_round_asset(image, _download_tennis_player_asset(item, "away"), 735, 170, 125)
 
-    def fit_text(text, max_width):
-        for size in range(28, 15, -1):
-            f = _get_font(size, bold=True)
-            if draw.textbbox((0, 0), text, font=f)[2] <= max_width:
-                return f
-        return _get_font(16, bold=True)
     def center(text, x, y, font, fill=(244, 248, 247)):
         bbox = draw.textbbox((0, 0), text, font=font)
         draw.text((x - (bbox[2] - bbox[0]) / 2, y), text, font=font, fill=fill)
 
-    center(f"{item.get('home_country', '')} {p1}".strip(), 165, 245, fit_text(p1, 270))
-    center(f"{item.get('away_country', '')} {p2}".strip(), 735, 245, fit_text(p2, 270))
+    _center_tennis_player_label(
+        draw, item.get("home_country"), p1, 165, 245, 270, size=28, canvas=image
+    )
+    _center_tennis_player_label(
+        draw, item.get("away_country"), p2, 735, 245, 270, size=28, canvas=image
+    )
 
     score = _sport_score(item)
     draw.rounded_rectangle((325, 112, 575, 180), radius=17, fill=(16, 36, 42), outline=(43, 69, 72), width=1)
@@ -1368,11 +1783,27 @@ def _create_sport_tennis_card(item: dict) -> io.BytesIO:
     center(status, 450, 200, status_font, pill_text)
 
     if item.get("winner"):
-        center(f"🏆 Winner: {item['winner']}", 450, 270, _get_font(18, bold=True), (231, 244, 239))
+        winner = str(item["winner"])
+        winner_country = ""
+        if winner.casefold() == p1.casefold():
+            winner_country = str(item.get("home_country") or "")
+        elif winner.casefold() == p2.casefold():
+            winner_country = str(item.get("away_country") or "")
+        _center_tennis_player_label(
+            draw,
+            winner_country,
+            winner,
+            450,
+            270,
+            600,
+            size=18,
+            prefix="🏆 Winner: ",
+            canvas=image,
+        )
     if item.get("round"):
         center(f"🏟 {item['round']}", 450, 298, _get_font(16, bold=True), (139, 166, 163))
 
-    _draw_sport_odds(draw, center, item, 352)
+    _draw_sport_odds(draw, center, item, 352, canvas=image)
     output = io.BytesIO()
     output.name = "tennis_card.png"
     image.save(output, format="PNG", optimize=True)
@@ -1588,12 +2019,28 @@ def _sport_fallback_text(item: dict) -> str:
             coefficient = f"{float(price):.2f}" if price is not None else "—"
             lines.append(f"{row.get('position')}. {row.get('name')} — {row.get('points')} pts • {coefficient}")
         return "\n".join(lines)
-    lines = [f"{icon} {competition}", "", f"{item.get('home_name')} vs {item.get('away_name')}", _sport_status_label(item)]
+    if item.get("type") == "player_match":
+        home_name = _format_tennis_player_name(
+            item.get("home_country"), str(item.get("home_name") or "Player 1")
+        )
+        away_name = _format_tennis_player_name(
+            item.get("away_country"), str(item.get("away_name") or "Player 2")
+        )
+    else:
+        home_name = str(item.get("home_name") or "")
+        away_name = str(item.get("away_name") or "")
+    lines = [f"{icon} {competition}", "", f"{home_name} vs {away_name}", _sport_status_label(item)]
     score = _sport_score(item)
     if score != "VS":
         lines.append(score)
     if item.get("winner"):
-        lines.append(f"🏆 Winner: {item['winner']}")
+        winner = str(item["winner"])
+        if item.get("type") == "player_match":
+            if winner.casefold() == str(item.get("home_name") or "").casefold():
+                winner = _format_tennis_player_name(item.get("home_country"), winner)
+            elif winner.casefold() == str(item.get("away_name") or "").casefold():
+                winner = _format_tennis_player_name(item.get("away_country"), winner)
+        lines.append(f"🏆 Winner: {winner}")
     odds = item.get("odds") or {}
     if odds:
         bookmaker = str(odds.get("bookmaker") or "").strip()
@@ -1758,6 +2205,17 @@ async def handle_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if destination == "back_to_previous" and str(mode or "").startswith("sport_"):
         sport = context.user_data.get("sport")
 
+        if screen == "sport_period_selection" and sport in SPORT_VARIANTS:
+            context.user_data.pop("sport_variant", None)
+            context.user_data["screen"] = "sport_variant_selection"
+            await _edit_navigation_message(
+                query,
+                context,
+                _sport_variant_title(sport),
+                reply_markup=_sport_variant_keyboard(sport),
+            )
+            return
+
         if screen == "sport_period_selection" and sport == "tennis":
             context.user_data["screen"] = "tennis_tour_selection"
             await _edit_navigation_message(
@@ -1777,7 +2235,11 @@ async def handle_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 (
                     f"🎾 Tennis — {str(context.user_data.get('tennis_tour') or 'ATP').upper()}\n\n📅 Choose a period"
                     if sport == "tennis"
-                    else _sport_period_title(sport, context.user_data.get("period", "today"))
+                    else _sport_period_title(
+                        sport,
+                        context.user_data.get("period", "today"),
+                        context.user_data.get("sport_variant"),
+                    )
                 ),
                 reply_markup=_sport_period_keyboard(sport),
             )
@@ -1831,7 +2293,8 @@ async def handle_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if sport:
             await _show_sport_matches(
                 query, context, sport, context.user_data.get("period"),
-                context.user_data.get("tennis_tour")
+                context.user_data.get("tennis_tour"),
+                context.user_data.get("sport_variant"),
             )
         return
 
@@ -2094,6 +2557,7 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_sport_selection, pattern=r"^sport:"))
+    application.add_handler(CallbackQueryHandler(handle_sport_variant_selection, pattern=r"^sport_variant:"))
     application.add_handler(CallbackQueryHandler(handle_tennis_tour_selection, pattern=r"^tennis_tour:"))
     application.add_handler(CallbackQueryHandler(handle_sport_period_selection, pattern=r"^sport_period:"))
     application.add_handler(CallbackQueryHandler(handle_period_selection, pattern=r"^period:"))
